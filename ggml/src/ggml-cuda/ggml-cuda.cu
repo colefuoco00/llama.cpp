@@ -3053,11 +3053,53 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
-static bool ggml_cuda_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops, std::initializer_list<enum ggml_unary_op> unary_ops) {
+// Helper to check if all nodes in a fusion range belong to the same concurrent branch
+static bool ggml_cuda_fusion_same_branch(const struct ggml_cgraph *         cgraph,
+                                         int                                node_idx,
+                                         size_t                             count,
+                                         const ggml_cuda_concurrent_event * concurrent_event) {
+    if (concurrent_event == nullptr) {
+        return true;
+    }
+
+    const ggml_tensor * first_node = cgraph->nodes[node_idx];
+    auto                it         = concurrent_event->stream_mapping.find(first_node);
+    if (it == concurrent_event->stream_mapping.end()) {
+        return true;
+    }
+
+    int expected_stream = it->second;
+
+    // Check all other nodes in the fusion are on the same stream/branch
+    for (size_t j = 1; j < count; j++) {
+        const ggml_tensor * node = cgraph->nodes[node_idx + j];
+        auto                it2  = concurrent_event->stream_mapping.find(node);
+        if (it2 == concurrent_event->stream_mapping.end()) {
+            continue;
+        }
+        if (it2->second != expected_stream) {
+            GGML_LOG_DEBUG("Cannot fuse across concurrent branches: %s and %s are on different streams\n",
+                           first_node->name, node->name);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+                               int                                       node_idx,
+                               std::initializer_list<enum ggml_op>       ops,
+                               std::initializer_list<enum ggml_unary_op> unary_ops,
+                               const ggml_cuda_concurrent_event *        concurrent_event = nullptr) {
 #ifndef NDEBUG
     const size_t num_unary = std::count(ops.begin(), ops.end(), GGML_OP_UNARY);
     GGML_ASSERT(unary_ops.size() == num_unary);
 #endif
+
+    // If in concurrent region, check all nodes belong to the same branch
+    if (!ggml_cuda_fusion_same_branch(cgraph, node_idx, ops.size(), concurrent_event)) {
+        return false;
+    }
 
     //TODO: remove special case once ggml_can_fuse can handle empty nodes
     std::initializer_list<enum ggml_op> topk_moe_ops =
@@ -3354,8 +3396,8 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                 // start of fusion operations
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
                 if (!disable_fusion) {
-
-                    if (ggml_cuda_can_fuse(cgraph, i, ggml_cuda_topk_moe_ops(/*with norm*/ true), {})) {
+                    if (ggml_cuda_can_fuse(cgraph, i, ggml_cuda_topk_moe_ops(/*with norm*/ true), {},
+                                           concurrent_event)) {
                         ggml_tensor * weights          = cgraph->nodes[i + 9];
                         ggml_tensor * selected_experts = cgraph->nodes[i + 3];
                         ggml_tensor * clamp            = cgraph->nodes[i + 7];
@@ -3365,7 +3407,8 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                         continue;
                     }
 
-                    if (ggml_cuda_can_fuse(cgraph, i, ggml_cuda_topk_moe_ops(/*with norm*/ false), {})) {
+                    if (ggml_cuda_can_fuse(cgraph, i, ggml_cuda_topk_moe_ops(/*with norm*/ false), {},
+                                           concurrent_event)) {
                         ggml_tensor * weights          = cgraph->nodes[i + 4];
                         ggml_tensor * selected_experts = cgraph->nodes[i + 3];
                         ggml_cuda_op_topk_moe(*cuda_ctx, node->src[0], weights, selected_experts, /*with norm*/ false,
@@ -3375,7 +3418,8 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                     }
 
                     if (ggml_cuda_can_fuse(cgraph, i,
-                                           ggml_cuda_topk_moe_ops(/*with norm*/ false, /*delayed softmax*/ true), {})) {
+                                           ggml_cuda_topk_moe_ops(/*with norm*/ false, /*delayed softmax*/ true), {},
+                                           concurrent_event)) {
                         ggml_tensor * weights = cgraph->nodes[i + 5];
                         ggml_tensor * ids     = cgraph->nodes[i + 1];
 
@@ -3385,7 +3429,8 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                         continue;
                     }
 
-                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {},
+                                           concurrent_event)) {
                         ggml_tensor * rope = cgraph->nodes[i];
                         ggml_tensor * set_rows = cgraph->nodes[i + 2];
 
@@ -3406,7 +3451,9 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                             if (cgraph->nodes[i + n_fuse] != cgraph->nodes[i + n_fuse + 1]->src[0]) {
                                 break;
                             }
-                            if (!ggml_are_same_layout(cgraph->nodes[i + n_fuse]->src[1], cgraph->nodes[i + n_fuse + 1]->src[1])) {
+                            if (!ggml_are_same_layout(cgraph->nodes[i + n_fuse]->src[1],
+                                                      cgraph->nodes[i + n_fuse + 1]->src[1]) ||
+                                !ggml_cuda_fusion_same_branch(cgraph, i, n_fuse + 2, concurrent_event)) {
                                 break;
                             }
                         }
@@ -3431,7 +3478,8 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
                         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
-                        if (ggml_cuda_can_fuse(cgraph, i, { op, bias_op, op, bias_op, GGML_OP_GLU }, {})) {
+                        if (ggml_cuda_can_fuse(cgraph, i, { op, bias_op, op, bias_op, GGML_OP_GLU }, {},
+                                               concurrent_event)) {
                             ggml_tensor * glu         = cgraph->nodes[i + 4];
                             ggml_tensor * gate_bias_n = glu->src[0];
                             ggml_tensor * up_bias_n   = glu->src[1];
@@ -3508,7 +3556,7 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                                 fused_node_count = 5;
                                 break;
                             }
-                        } else if (ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {})) {
+                        } else if (ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {}, concurrent_event)) {
                             ggml_tensor * glu  = cgraph->nodes[i + 2];
                             ggml_tensor * gate = glu->src[0];
                             ggml_tensor * up   = glu->src[1];
@@ -3558,6 +3606,10 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
                         if (!ggml_can_fuse(cgraph, i, { op, bias_op })) {
+                            continue;
+                        }
+
+                        if (!ggml_cuda_fusion_same_branch(cgraph, i, 2, concurrent_event)) {
                             continue;
                         }
 
@@ -3615,19 +3667,21 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                         continue;
                     }
 
-                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {},
+                                           concurrent_event)) {
                         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
                         i += 2;
                         continue;
                     }
 
-                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL}, {})) {
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}, concurrent_event)) {
                         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
                         continue;
                     }
 
-                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE },
+                                           { GGML_UNARY_OP_TANH }, concurrent_event)) {
                         i += 2;
                         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i], node);
                         continue;
