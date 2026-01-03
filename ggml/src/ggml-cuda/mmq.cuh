@@ -3147,7 +3147,9 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
 
             float result = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
             if constexpr (has_bias) {
-                result += bias[i];
+                if (bias != nullptr) {
+                    result += bias[i];
+                }
             }
             dst[ids_dst[j]*stride + i] = result;
         }
@@ -3200,7 +3202,9 @@ static __device__ __forceinline__ void mmq_write_back_mma(
 
                 float result = sum[(j0/tile_C::J + n)*tile_C::ne + l];
                 if constexpr (has_bias) {
-                    result += bias[i];
+                    if (bias != nullptr) {
+                        result += bias[i];
+                    }
                 }
                 dst[ids_dst[j]*stride + i] = result;
             }
@@ -3562,7 +3566,9 @@ static __global__ void mul_mat_q(
 
         const float * bias_ptr = nullptr;
         if constexpr (has_bias) {
-            bias_ptr = bias + wt*stride_sample_bias + zt*stride_channel_bias;
+            if (bias != nullptr) {
+                bias_ptr = bias + wt*stride_sample_bias + zt*stride_channel_bias;
+            }
         }
 
         constexpr bool fixup = false;
@@ -3647,7 +3653,11 @@ static __global__ void mul_mat_q(
 
         const float * bias_ptr = nullptr;
         if constexpr (has_bias) {
-            bias_ptr = bias + wt*stride_sample_bias + zt*stride_channel_bias;
+            // Only apply bias for complete tiles started by this block (kb0_start == 0).
+            // Continued tiles (kb0_start > 0) will have bias applied in fixup kernel.
+            if (bias != nullptr && kb0_start == 0) {
+                bias_ptr = bias + wt*stride_sample_bias + zt*stride_channel_bias;
+            }
         }
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
@@ -4003,6 +4013,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     }
 
     if (has_bias) {
+        // Bias is applied in main kernel for complete tiles (kb0_start == 0),
+        // and in fixup kernel for continued/split tiles.
         if (args.nrows_x % mmq_y == 0) {
             constexpr bool need_check = false;
             mul_mat_q<type, mmq_x, need_check, true><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>

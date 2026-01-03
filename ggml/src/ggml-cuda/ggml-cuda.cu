@@ -2169,6 +2169,42 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * tensor) {
+    const ggml_tensor * src0 = tensor->src[0];
+    const ggml_tensor * src1 = tensor->src[1];
+    const ggml_tensor * dst  = tensor;
+
+    const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
+
+    // Check for bad padding that would cause issues
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                   src0->view_src;
+
+    if (bad_padding_clear) {
+        return false;
+    }
+
+    // Check types
+    if (!ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // Check for split buffers (not supported)
+    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
+                       ggml_backend_buft_is_cuda_split(src1->buffer->buft);
+    if (split) {
+        return false;
+    }
+
+    // Check if MMQ should be used for this configuration
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int64_t ne_batch = is_mul_mat_id ? src1->ne[2] : src1->ne[1];
+    const int64_t n_experts = is_mul_mat_id ? src0->ne[2] : 1;
+
+    return ggml_cuda_should_use_mmq(src0->type, cc, ne_batch, n_experts);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
@@ -3644,19 +3680,12 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                                     continue;
                                 }
 
-                                // we don't support repeating adds
-                                if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
+                                // we *only* support repeating adds
+                                if (bias_op == GGML_OP_ADD && !(bias_tensor->ne[0] == mm_node->ne[0] && bias_tensor->ne[1] == 1)) {
                                     continue;
                                 }
 
-                                const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-                                // For MUL_MAT_ID: ne12 = src1->ne[2], n_experts = src0->ne[2]
-                                // For MUL_MAT: ne11 = src1->ne[1], n_experts = 1
-                                const int64_t ne_batch = (op == GGML_OP_MUL_MAT_ID) ? src1->ne[2] : src1->ne[1];
-                                const int64_t n_experts = (op == GGML_OP_MUL_MAT_ID) ? src0->ne[2] : 1;
-                                bool use_mmq = ggml_cuda_should_use_mmq(src0->type, cc, ne_batch, n_experts);
-
-                                if (use_mmq) {
+                                if (ggml_cuda_should_fuse_mul_mat_q(mm_node)) {
                                     ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, bias_node, bias_tensor);
                                     fused_mul_mat_vec = true;
                                     fused_node_count = 2;

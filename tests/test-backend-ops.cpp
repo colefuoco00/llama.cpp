@@ -8083,7 +8083,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
                         if (!with_gate && with_bias) {
                             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 32, 32, 256,
-                                use_id, 16, 8, b, with_bias, with_gate));
+                               use_id, 16, 8, b, with_bias, with_gate));
+                            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 129, 32, 2880,
+                               use_id, 16, 8, b, with_bias, with_gate));
                         }
 
                         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
