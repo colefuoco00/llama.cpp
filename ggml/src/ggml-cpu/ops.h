@@ -111,6 +111,19 @@ void ggml_compute_forward_cross_entropy_loss_back(const struct ggml_compute_para
 void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+
+// Fused MUL_MAT_ID + GLU for MoE models
+void ggml_compute_forward_mul_mat_id_glu_fused(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * up_mm,
+        const struct ggml_tensor * gate_weights,
+        const struct ggml_tensor * up_bias,
+        const struct ggml_tensor * gate_bias,
+        enum ggml_glu_op glu_op,
+        float swiglu_oai_alpha,
+        float swiglu_oai_limit);
+
 #ifdef __cplusplus
 }
 #endif

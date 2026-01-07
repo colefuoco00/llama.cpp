@@ -7,6 +7,7 @@
 #include "unary-ops.h"
 #include "vec.h"
 
+#include <atomic>
 #include <cfloat>
 #include <algorithm>
 #include <cmath>
@@ -10469,5 +10470,291 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
             {
                 GGML_ABORT("fatal error - sgd is F32 only");
             }
+    }
+}
+
+// ggml_compute_forward_mul_mat_id_glu_fused
+//
+// Fused MUL_MAT_ID + GLU for MoE models
+// Computes: output = silu(gate_weights @ input) * (up_weights @ input)
+// with optional biases
+
+struct mmid_row_mapping {
+    int32_t i1;
+    int32_t i2;
+};
+
+#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*n_ids*n_tokens + (i1)]
+
+static void * mmid_incr_ptr_aligned(void ** p, size_t size, size_t align) {
+    void * ptr = *p;
+    ptr = (void *) GGML_PAD((uintptr_t) ptr, align);
+    *p = (void *) ((char *) ptr + size);
+    return ptr;
+}
+
+template<bool has_fusion, ggml_glu_op glu_op>
+static void ggml_compute_forward_mul_mat_id_glu_fused_impl(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        const ggml_tensor * up_mm,
+        const ggml_tensor * gate_weights,
+        const ggml_tensor * up_bias,
+        const ggml_tensor * gate_bias,
+        float swiglu_oai_alpha,
+        float swiglu_oai_limit) {
+
+    // Use up_mm's sources for weights, input, and ids
+    const ggml_tensor * up_weights = up_mm->src[0];
+    const ggml_tensor * input = up_mm->src[1];
+    const ggml_tensor * ids = up_mm->src[2];
+
+    // For GGML_TENSOR_BINARY_OP_LOCALS macro
+    const ggml_tensor * src0 = up_weights;
+    const ggml_tensor * src1 = input;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const ggml_type type = up_weights->type;
+
+    const bool src1_cont = ggml_is_contiguous(input);
+
+    const ggml_type_traits_cpu * type_traits = ggml_get_type_traits_cpu(type);
+    ggml_type    const vec_dot_type    = type_traits->vec_dot_type;
+    ggml_vec_dot_t    const vec_dot      = type_traits->vec_dot;
+    ggml_from_float_t const from_float   = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
+
+    // we don't support permuted up_weights or input
+    GGML_ASSERT(nb00 == ggml_type_size(type));
+    GGML_ASSERT(nb10 == ggml_type_size(input->type));
+
+    // dst cannot be transposed or permuted
+    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb0 <= nb1);
+    GGML_ASSERT(nb1 <= nb2);
+    GGML_ASSERT(nb2 <= nb3);
+
+    // row groups
+    const int n_ids = ids->ne[0];    // n_expert_used
+    const int n_as  = ne02;          // n_expert
+    const int n_tokens = ids->ne[1]; // number of tokens
+
+    void * wdata_cur = params->wdata;
+
+    if (input->type != vec_dot_type) {
+        mmid_incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(input)), sizeof(int64_t));
+    }
+
+    int64_t * matrix_row_counts = (int64_t *)
+        mmid_incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
+
+    mmid_row_mapping * matrix_rows = (mmid_row_mapping *)
+        mmid_incr_ptr_aligned(&wdata_cur, n_as*n_ids*n_tokens*sizeof(mmid_row_mapping), sizeof(int64_t));
+
+    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = (char (*)[CACHE_LINE_SIZE])
+        mmid_incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+
+    GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
+
+    if (input->type != vec_dot_type) {
+        char * wdata = (char *) params->wdata;
+
+        const size_t nbw0 = ggml_type_size(vec_dot_type);
+        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+        const size_t nbw2 = nbw1*ne11;
+        const size_t nbw3 = nbw2*ne12;
+
+        GGML_ASSERT(params->wsize >= (size_t)(ne13*nbw3));
+        GGML_ASSERT(input->type == GGML_TYPE_F32);
+
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    size_t bs = ggml_blck_size(vec_dot_type);
+                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
+                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                    from_float((float *)((char *) input->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                               (ne10_block_end - ne10_block_start) * bs);
+                }
+            }
+        }
+    }
+
+    if (ith == 0) {
+        // initialize matrix_row_counts
+        memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+
+        // group rows by up_weights matrix (expert)
+        for (int64_t iid1 = 0; iid1 < n_tokens; ++iid1) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+
+                GGML_ASSERT(i02 >= 0 && i02 < n_as);
+
+                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = {id, (int32_t)iid1};
+                matrix_row_counts[i02] += 1;
+            }
+        }
+    }
+
+    // reset current_chunk
+    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+        std::atomic<int> * current_chunk_ctr = (std::atomic<int> *)(atomic_current_chunk + cur_a);
+        current_chunk_ctr->store(nth, std::memory_order_relaxed);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+        const int64_t cne1 = matrix_row_counts[cur_a];
+
+        if (cne1 == 0) {
+            continue;
+        }
+
+        const char * up_src0_cur = (const char *) up_weights->data + cur_a * nb02;
+        const char * gate_src0_cur = nullptr;
+        const float * up_bias_row = nullptr;
+        const float * gate_bias_row = nullptr;
+
+        if constexpr (has_fusion) {
+            GGML_ASSERT(gate_weights != nullptr);
+            gate_src0_cur = (const char *) gate_weights->data + cur_a * gate_weights->nb[2];
+            if (up_bias) {
+                up_bias_row = (const float *)((const char *) up_bias->data + cur_a * up_bias->nb[1]);
+            }
+            if (gate_bias) {
+                gate_bias_row = (const float *)((const char *) gate_bias->data + cur_a * gate_bias->nb[1]);
+            }
+        }
+
+        const void * wdata = (input->type == vec_dot_type) ? input->data : params->wdata;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+        const int64_t nr0 = ne01;  // output dimension (n_ff)
+        const int64_t nr1 = cne1;  // batch elements for this expert
+
+        int chunk_size = 16;
+        if (nr0 == 1 || nr1 == 1) {
+            chunk_size = 64;
+        }
+
+        // disable chunking for NUMA
+        const bool disable_chunking = ggml_is_numa();
+
+        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+        int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+
+        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
+            nchunk0 = nr0 > nr1 ? nth : 1;
+            nchunk1 = nr0 > nr1 ? 1 : nth;
+        }
+
+        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+        const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+
+        int current_chunk = ith;
+
+        std::atomic<int> * current_chunk_ctr = (std::atomic<int> *)(atomic_current_chunk + cur_a);
+
+        while (current_chunk < nchunk0 * nchunk1) {
+            const int64_t ith0 = current_chunk % nchunk0;
+            const int64_t ith1 = current_chunk / nchunk0;
+
+            const int64_t ir0_start = dr0 * ith0;
+            const int64_t ir0_end = std::min(ir0_start + dr0, nr0);
+
+            const int64_t ir1_start = dr1 * ith1;
+            const int64_t ir1_end = std::min(ir1_start + dr1, nr1);
+
+            // Process chunk
+            const int64_t blck_0 = 16;
+            const int64_t blck_1 = 16;
+
+            float tmp[16];
+
+            for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+                for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                    for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
+                        const int64_t _i12 = ir1;
+
+                        mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
+                        const int id       = row_mapping.i1;
+
+                        const int64_t i11 = id % ne11;
+                        const int64_t i12 = row_mapping.i2;
+
+                        const int64_t i1 = id;
+                        const int64_t i2 = i12;
+
+                        const char * src1_col = (const char *) wdata +
+                            (src1_cont || input->type != vec_dot_type
+                            ? (i11      + i12*ne11)*row_size
+                            : (i11*nb11 + i12*nb12));
+
+                        float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
+
+                        for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                            if constexpr (has_fusion) {
+                                // Compute both projections
+                                float up_val, gate_val;
+                                vec_dot(ne00, &up_val, 0, up_src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                                vec_dot(ne00, &gate_val, 0, gate_src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+
+                                // Apply biases
+                                if (up_bias_row) up_val += up_bias_row[ir0];
+                                if (gate_bias_row) gate_val += gate_bias_row[ir0];
+
+                                // Apply SwiGLU inline: silu(gate) * up
+                                if constexpr (glu_op == GGML_GLU_OP_SWIGLU) {
+                                    dst_col[ir0] = ggml_silu_f32(gate_val) * up_val;
+                                } else { // SWIGLU_OAI
+                                    float x = swiglu_oai_alpha * gate_val;
+                                    x = std::fmin(std::fmax(x, -swiglu_oai_limit), swiglu_oai_limit);
+                                    dst_col[ir0] = (gate_val / (1.0f + std::exp(-x))) * up_val;
+                                }
+                            } else {
+                                // Original non-fused path
+                                vec_dot(ne00, &tmp[ir0 - iir0], 0, up_src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                            }
+                        }
+
+                        if constexpr (!has_fusion) {
+                            memcpy(&dst_col[iir0], tmp, (std::min(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
+                        }
+                    }
+                }
+            }
+
+            if (nth >= nchunk0 * nchunk1) {
+                break;
+            }
+
+            current_chunk = current_chunk_ctr->fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+void ggml_compute_forward_mul_mat_id_glu_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        const ggml_tensor * up_mm,
+        const ggml_tensor * gate_weights,
+        const ggml_tensor * up_bias,
+        const ggml_tensor * gate_bias,
+        ggml_glu_op glu_op,
+        float swiglu_oai_alpha,
+        float swiglu_oai_limit) {
+
+    if (glu_op == GGML_GLU_OP_SWIGLU) {
+        ggml_compute_forward_mul_mat_id_glu_fused_impl<true, GGML_GLU_OP_SWIGLU>(
+            params, dst, up_mm, gate_weights, up_bias, gate_bias, swiglu_oai_alpha, swiglu_oai_limit);
+    } else {
+        ggml_compute_forward_mul_mat_id_glu_fused_impl<true, GGML_GLU_OP_SWIGLU_OAI>(
+            params, dst, up_mm, gate_weights, up_bias, gate_bias, swiglu_oai_alpha, swiglu_oai_limit);
     }
 }

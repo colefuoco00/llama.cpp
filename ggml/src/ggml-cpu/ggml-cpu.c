@@ -2943,6 +2943,132 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        // Check for MUL_MAT_ID + GLU fusion opportunity
+        bool fused = false;
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            const struct ggml_tensor * src0 = node->src[0];
+            const struct ggml_tensor * src1 = node->src[1];
+
+            // Only fuse for GEMV (batch size 1) with quantized weights
+            const bool is_gemv = (src1->ne[1] == 1);
+            const bool is_quantized = ggml_is_quantized(src0->type);
+
+            if (is_gemv && is_quantized) {
+                // Pattern: MUL_MAT_ID + MUL_MAT_ID + GLU (3 nodes, no bias)
+                const enum ggml_op pattern3[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+
+                if (node_n + 2 < cgraph->n_nodes && is_gemv && cgraph->nodes[node_n + 1]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[node_n+ 2]->op == GGML_OP_GLU) {
+                    struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
+                    enum ggml_glu_op glu_op = ggml_get_glu_op(glu);
+
+                    // Only fuse SWIGLU variants
+                    if (glu_op == GGML_GLU_OP_SWIGLU || glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+                        struct ggml_tensor * gate_mm = glu->src[0];
+                        struct ggml_tensor * up_mm = glu->src[1];
+
+                        // Verify which node is gate vs up
+                        bool ok = (gate_mm == cgraph->nodes[node_n] && up_mm == cgraph->nodes[node_n + 1]) ||
+                                  (gate_mm == cgraph->nodes[node_n + 1] && up_mm == cgraph->nodes[node_n]);
+
+                        if (ok) {
+                            // Get SWIGLU_OAI params if needed
+                            float alpha = 1.702f;
+                            float limit = 7.0f;
+                            if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+                                alpha = ggml_get_op_params_f32(glu, 2);
+                                limit = ggml_get_op_params_f32(glu, 3);
+                            }
+
+                            // Call fused kernel with glu tensor as dst (it has up projection's src layout)
+                            // We need to set up so that dst->src[0] = up_weights, dst->src[1] = input, dst->src[2] = ids
+                            // The GLU output tensor already has the right shape
+
+                            ggml_compute_forward_mul_mat_id_glu_fused(
+                                &params, glu,
+                                up_mm,            // up MUL_MAT_ID tensor (for src layout)
+                                gate_mm->src[0],  // gate weights
+                                NULL, NULL,       // no biases
+                                glu_op,
+                                alpha, limit
+                            );
+
+                            fused = true;
+                            node_n += 2;  // skip the next 2 nodes
+
+                            if (node_n + 1 < cgraph->n_nodes) {
+                                ggml_barrier(state->threadpool);
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // Pattern: MUL_MAT_ID + ADD_ID + MUL_MAT_ID + ADD_ID + GLU (5 nodes, with bias)
+                const enum ggml_op pattern5[] = { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID,
+                                                   GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_GLU };
+
+                if (!fused && node_n + 4 < cgraph->n_nodes && ggml_can_fuse(cgraph, node_n, pattern5, 5)) {
+                    struct ggml_tensor * glu = cgraph->nodes[node_n + 4];
+                    enum ggml_glu_op glu_op = ggml_get_glu_op(glu);
+
+                    if (glu_op == GGML_GLU_OP_SWIGLU || glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+                        struct ggml_tensor * up_mm = cgraph->nodes[node_n];
+                        struct ggml_tensor * up_add = cgraph->nodes[node_n + 1];
+                        struct ggml_tensor * gate_mm = cgraph->nodes[node_n + 2];
+                        struct ggml_tensor * gate_add = cgraph->nodes[node_n + 3];
+
+                        // Verify the pattern: gate_add feeds gate input of GLU, up_add feeds up input
+                        struct ggml_tensor * glu_gate = glu->src[0];
+                        struct ggml_tensor * glu_up = glu->src[1];
+
+                        bool ok = (glu_gate == gate_add && glu_up == up_add) ||
+                                  (glu_gate == up_add && glu_up == gate_add);
+
+                        if (ok) {
+                            // Swap if needed
+                            if (glu_gate == up_add) {
+                                struct ggml_tensor * tmp = up_mm;
+                                up_mm = gate_mm;
+                                gate_mm = tmp;
+                                tmp = up_add;
+                                up_add = gate_add;
+                                gate_add = tmp;
+                            }
+
+                            // Extract bias tensors
+                            struct ggml_tensor * up_bias = (up_add->src[0] == up_mm) ? up_add->src[1] : up_add->src[0];
+                            struct ggml_tensor * gate_bias = (gate_add->src[0] == gate_mm) ? gate_add->src[1] : gate_add->src[0];
+
+                            float alpha = 1.702f;
+                            float limit = 7.0f;
+                            if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+                                alpha = ggml_get_op_params_f32(glu, 2);
+                                limit = ggml_get_op_params_f32(glu, 3);
+                            }
+
+                            ggml_compute_forward_mul_mat_id_glu_fused(
+                                &params, glu,
+                                up_mm,            // up MUL_MAT_ID tensor (for src layout)
+                                gate_mm->src[0],  // gate weights
+                                up_bias,
+                                gate_bias,
+                                glu_op,
+                                alpha, limit
+                            );
+
+                            fused = true;
+                            node_n += 4;  // skip the next 4 nodes
+
+                            if (node_n + 1 < cgraph->n_nodes) {
+                                ggml_barrier(state->threadpool);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&
