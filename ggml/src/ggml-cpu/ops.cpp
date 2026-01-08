@@ -10493,7 +10493,7 @@ static void * mmid_incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
-template<bool has_fusion, ggml_glu_op glu_op>
+template<bool has_fusion>
 static void ggml_compute_forward_mul_mat_id_glu_fused_impl(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -10501,6 +10501,7 @@ static void ggml_compute_forward_mul_mat_id_glu_fused_impl(
         const ggml_tensor * gate_weights,
         const ggml_tensor * up_bias,
         const ggml_tensor * gate_bias,
+        ggml_glu_op glu_op,
         float swiglu_oai_alpha,
         float swiglu_oai_limit) {
 
@@ -10609,6 +10610,11 @@ static void ggml_compute_forward_mul_mat_id_glu_fused_impl(
 
     ggml_barrier(params->threadpool);
 
+    // Setup fusion pointers (only used when has_fusion is true)
+    const bool use_gate = has_fusion && gate_weights != nullptr;
+    const bool use_up_bias = has_fusion && up_bias != nullptr;
+    const bool use_gate_bias = has_fusion && gate_bias != nullptr;
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -10622,12 +10628,13 @@ static void ggml_compute_forward_mul_mat_id_glu_fused_impl(
         const float * gate_bias_row = nullptr;
 
         if constexpr (has_fusion) {
-            GGML_ASSERT(gate_weights != nullptr);
-            gate_src0_cur = (const char *) gate_weights->data + cur_a * gate_weights->nb[2];
-            if (up_bias) {
+            if (use_gate) {
+                gate_src0_cur = (const char *) gate_weights->data + cur_a * gate_weights->nb[2];
+            }
+            if (use_up_bias) {
                 up_bias_row = (const float *)((const char *) up_bias->data + cur_a * up_bias->nb[1]);
             }
-            if (gate_bias) {
+            if (use_gate_bias) {
                 gate_bias_row = (const float *)((const char *) gate_bias->data + cur_a * gate_bias->nb[1]);
             }
         }
@@ -10699,27 +10706,45 @@ static void ggml_compute_forward_mul_mat_id_glu_fused_impl(
                         float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
 
                         for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                            // Compute up projection
+                            float up_val;
+                            vec_dot(ne00, &up_val, 0, up_src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+
                             if constexpr (has_fusion) {
-                                // Compute both projections
-                                float up_val, gate_val;
-                                vec_dot(ne00, &up_val, 0, up_src0_cur + ir0*nb01, 0, src1_col, 0, 1);
-                                vec_dot(ne00, &gate_val, 0, gate_src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                                // Compute gate projection
+                                float gate_val;
+                                if (use_gate) {
+                                    vec_dot(ne00, &gate_val, 0, gate_src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                                }
 
                                 // Apply biases
-                                if (up_bias_row) up_val += up_bias_row[ir0];
-                                if (gate_bias_row) gate_val += gate_bias_row[ir0];
+                                if (up_bias_row) {
+                                    up_val += up_bias_row[ir0];
+                                }
+                                if (gate_bias_row) {
+                                    gate_val += gate_bias_row[ir0];
+                                }
 
-                                // Apply SwiGLU inline: silu(gate) * up
-                                if constexpr (glu_op == GGML_GLU_OP_SWIGLU) {
-                                    dst_col[ir0] = ggml_silu_f32(gate_val) * up_val;
-                                } else { // SWIGLU_OAI
-                                    float x = swiglu_oai_alpha * gate_val;
-                                    x = std::fmin(std::fmax(x, -swiglu_oai_limit), swiglu_oai_limit);
-                                    dst_col[ir0] = (gate_val / (1.0f + std::exp(-x))) * up_val;
+                                // Apply GLU
+                                if (use_gate) {
+                                    switch (glu_op) {
+                                        case GGML_GLU_OP_SWIGLU:
+                                            dst_col[ir0] = ggml_silu_f32(gate_val) * up_val;
+                                            break;
+                                        case GGML_GLU_OP_SWIGLU_OAI: {
+                                            float x = swiglu_oai_alpha * gate_val;
+                                            x = std::fmin(std::fmax(x, -swiglu_oai_limit), swiglu_oai_limit);
+                                            dst_col[ir0] = (gate_val / (1.0f + std::exp(-x))) * up_val;
+                                        } break;
+                                        default:
+                                            dst_col[ir0] = up_val;
+                                            break;
+                                    }
+                                } else {
+                                    dst_col[ir0] = up_val;
                                 }
                             } else {
-                                // Original non-fused path
-                                vec_dot(ne00, &tmp[ir0 - iir0], 0, up_src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                                tmp[ir0 - iir0] = up_val;
                             }
                         }
 
@@ -10737,6 +10762,15 @@ static void ggml_compute_forward_mul_mat_id_glu_fused_impl(
             current_chunk = current_chunk_ctr->fetch_add(1, std::memory_order_relaxed);
         }
     }
+
+    if constexpr (!has_fusion) {
+        GGML_UNUSED(gate_weights);
+        GGML_UNUSED(up_bias);
+        GGML_UNUSED(gate_bias);
+        GGML_UNUSED(glu_op);
+        GGML_UNUSED(swiglu_oai_alpha);
+        GGML_UNUSED(swiglu_oai_limit);
+    }
 }
 
 void ggml_compute_forward_mul_mat_id_glu_fused(
@@ -10750,11 +10784,13 @@ void ggml_compute_forward_mul_mat_id_glu_fused(
         float swiglu_oai_alpha,
         float swiglu_oai_limit) {
 
-    if (glu_op == GGML_GLU_OP_SWIGLU) {
-        ggml_compute_forward_mul_mat_id_glu_fused_impl<true, GGML_GLU_OP_SWIGLU>(
-            params, dst, up_mm, gate_weights, up_bias, gate_bias, swiglu_oai_alpha, swiglu_oai_limit);
+    const bool has_fusion = gate_weights != nullptr || up_bias != nullptr || gate_bias != nullptr;
+
+    if (has_fusion) {
+        ggml_compute_forward_mul_mat_id_glu_fused_impl<true>(
+            params, dst, up_mm, gate_weights, up_bias, gate_bias, glu_op, swiglu_oai_alpha, swiglu_oai_limit);
     } else {
-        ggml_compute_forward_mul_mat_id_glu_fused_impl<true, GGML_GLU_OP_SWIGLU_OAI>(
-            params, dst, up_mm, gate_weights, up_bias, gate_bias, swiglu_oai_alpha, swiglu_oai_limit);
+        ggml_compute_forward_mul_mat_id_glu_fused_impl<false>(
+            params, dst, up_mm, gate_weights, up_bias, gate_bias, glu_op, swiglu_oai_alpha, swiglu_oai_limit);
     }
 }

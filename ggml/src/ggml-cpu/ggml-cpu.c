@@ -2955,9 +2955,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
             if (is_gemv && is_quantized) {
                 // Pattern: MUL_MAT_ID + MUL_MAT_ID + GLU (3 nodes, no bias)
-                const enum ggml_op pattern3[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
-
-                if (node_n + 2 < cgraph->n_nodes && is_gemv && cgraph->nodes[node_n + 1]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[node_n+ 2]->op == GGML_OP_GLU) {
+                if (node_n + 2 < cgraph->n_nodes &&
+                    cgraph->nodes[node_n + 1]->op == GGML_OP_MUL_MAT_ID &&
+                    cgraph->nodes[node_n + 2]->op == GGML_OP_GLU) {
                     struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
                     enum ggml_glu_op glu_op = ggml_get_glu_op(glu);
 
@@ -3004,10 +3004,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 }
 
                 // Pattern: MUL_MAT_ID + ADD_ID + MUL_MAT_ID + ADD_ID + GLU (5 nodes, with bias)
-                const enum ggml_op pattern5[] = { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID,
-                                                   GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_GLU };
+                // Manually check subgraph structure instead of using ggml_can_fuse
+                if (!fused && node_n + 4 < cgraph->n_nodes &&
+                    cgraph->nodes[node_n + 1]->op == GGML_OP_ADD_ID &&
+                    cgraph->nodes[node_n + 2]->op == GGML_OP_MUL_MAT_ID &&
+                    cgraph->nodes[node_n + 3]->op == GGML_OP_ADD_ID &&
+                    cgraph->nodes[node_n + 4]->op == GGML_OP_GLU) {
 
-                if (!fused && node_n + 4 < cgraph->n_nodes && ggml_can_fuse(cgraph, node_n, pattern5, 5)) {
                     struct ggml_tensor * glu = cgraph->nodes[node_n + 4];
                     enum ggml_glu_op glu_op = ggml_get_glu_op(glu);
 
