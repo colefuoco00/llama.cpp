@@ -747,7 +747,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 
         const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
 
-        const int aux_q4 = get_int_b1(bxi->qs, kqsx);
+        const int aux_q4 = get_int_b4(bxi->qs, kqsx);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
         const int k0 = kbx * (2 * QI_MXFP4) + kqsx;
 
@@ -815,7 +815,14 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restr
 
         // quantize_mxfp4_mmq permutes nibbles to match the quantized format
         const int k0 = kbx * 4;
-        memcpy(x_qs + i * MMQ_MMA_TILE_X_K_FP4 + k0, bxi->qs, 16);
+        //memcpy(x_qs + i * MMQ_MMA_TILE_X_K_FP4 + k0, bxi->qs, 16);
+        int * xs = (int *) x_qs + i * MMQ_MMA_TILE_X_K_FP4 + k0;
+        const int * bx = (const int *)bxi->qs;
+
+#pragma unroll
+        for (int ii = 0 ; ii < 4; ii++) {
+            xs[ii] = bx[ii];
+        }
 
         // Load E8M0 scales: pack 2 consecutive scales into one uint32
         if (kbx % 2 == 0) {

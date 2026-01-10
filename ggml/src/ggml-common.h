@@ -189,10 +189,10 @@ static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4
 
 #define QK_MXFP4 32
 typedef struct {
-    uint8_t e; // E8M0
+    uint32_t e; // E8M0
     uint8_t qs[QK_MXFP4/2];
 } block_mxfp4;
-static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+static_assert(sizeof(block_mxfp4) == sizeof(uint32_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
 
 #define QK5_0 32
 typedef struct {

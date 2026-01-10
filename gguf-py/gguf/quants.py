@@ -685,13 +685,17 @@ class MXFP4(__Quant, qtype=GGMLQuantizationType.MXFP4):
 
         qs = qs.reshape((n_blocks, cls.block_size // 2))
 
-        return np.concatenate([e, qs], axis=-1)
+        # pad scale to 4 bytes for alignment
+        e_padded = np.concatenate([e, np.zeros((n_blocks, 3), dtype=np.uint8)], axis=-1)
+
+        return np.concatenate([e_padded, qs], axis=-1)
 
     @classmethod
     def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
         n_blocks = blocks.shape[0]
 
-        e, qs = np.hsplit(blocks, [1])
+        e, qs = np.hsplit(blocks, [4])
+        e = e[:, :1]  # extract actual scale byte from 4-byte aligned field
 
         d = cls.e8m0_to_fp32_half(e)
 

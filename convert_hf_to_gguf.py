@@ -9816,11 +9816,13 @@ class GptOssModel(TextModel):
     def repack_mxfp4(self, new_name: str, blocks: Tensor, scales: Tensor):
         assert blocks.dtype == torch.uint8
         assert scales.dtype == torch.uint8
+        # pad scale to 4 bytes for alignment
         scales = scales.unsqueeze(-1)
+        scales_padded = torch.nn.functional.pad(scales, (0, 3), value=0)
         assert len(blocks.shape) == 4
-        assert len(scales.shape) == 4
+        assert len(scales_padded.shape) == 4
         blocks = self.transform_nibble_layout(blocks)
-        new_data = torch.concat((scales, blocks), dim=-1)
+        new_data = torch.concat((scales_padded, blocks), dim=-1)
         new_shape = [new_data.shape[0], new_data.shape[1], new_data.shape[2] * 32]
         logger.info(f"Repacked {new_name} with shape {new_shape} and quantization MXFP4")
         # flatten last dim
