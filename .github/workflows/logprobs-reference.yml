@@ -30,7 +30,7 @@ env:
 
 jobs:
   logprobs-test:
-    runs-on: "runs-on=${{ github.run_id }}/family=g4dn.12xlarge/image=ubuntu22-gpu-x64/"
+    runs-on: "runs-on=${{ github.run_id }}/family=g5.12xlarge/image=ubuntu22-gpu-x64/"
 
     steps:
       - name: Clone
