@@ -1730,13 +1730,24 @@ static void ggml_compute_forward_fused_moe_silu(
 
     const char * src1_q = (const char *) src1->data;
     if (src1->type != vec_dot_type) {
-        char * wdata = (char *) params->wdata + ith * (ne11 * row_size + CACHE_LINE_SIZE);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+        char * wdata = (char *) params->wdata;
+
+        const size_t bs   = ggml_blck_size(vec_dot_type);
+        const size_t nbw0 = ggml_type_size(vec_dot_type);
+        const int64_t nblocks     = ne10 / (int64_t) bs;
+        const int64_t block_start = (ith * nblocks) / nth;
+        const int64_t block_end   = ((ith + 1) * nblocks) / nth;
+
         for (int64_t i11 = 0; i11 < ne11; ++i11) {
-            from_float((float *)((char *) src1->data + i11*nb11),
-                       (void *)(wdata + i11*row_size),
-                       ne10);
+            from_float(
+                (float *)((char *) src1->data + i11*nb11) + block_start * bs,
+                (void *)(wdata + i11*row_size + block_start * nbw0),
+                (block_end - block_start) * bs);
         }
+
+        ggml_barrier(params->threadpool);
         src1_q = wdata;
     }
 
@@ -2891,12 +2902,7 @@ struct ggml_cplan ggml_graph_plan(
                         const int n_as = src0->ne[2];
                         // src1
                         if (src1->type != vec_dot_type) {
-                            size_t quant_buf = ggml_row_size(vec_dot_type, ggml_nelements(src1));
-                            // fused MoE path: each thread needs its own quantization buffer
-                            if (src1->ne[2] == 1) {
-                                quant_buf *= n_tasks;
-                            }
-                            cur += quant_buf + sizeof(int64_t);
+                            cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
                         }
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
