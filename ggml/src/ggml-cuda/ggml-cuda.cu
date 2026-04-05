@@ -82,7 +82,6 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
-#include <unordered_set>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -3055,12 +3054,20 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     // Loop over nodes in GGML graph to determine if CUDA graph update is required
     // and store properties to allow this comparison for the next token
-    std::unordered_set<ggml_tensor *> seen_node;
-    std::vector<ggml_tensor *> srcs_extra;
+
+    // Mark all nodes so we can identify non-node sources in O(1)
+    // Use a bit outside the public ggml_tensor_flag enum
+    const int32_t flag_seen = (1 << 31);
+    static_assert(!(flag_seen & ((GGML_TENSOR_FLAG_COMPUTE << 1) - 1)),
+        "flag_seen collides with public ggml_tensor_flag bits");
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        cgraph->nodes[i]->flags |= flag_seen;
+    }
+
+    size_t extra_idx = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         bool props_match = true;
-
-        seen_node.insert(cgraph->nodes[i]);
 
         if (!res) {
             props_match = ggml_cuda_graph_node_properties_match(cgraph->nodes[i], &graph->props[i]);
@@ -3072,28 +3079,30 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
         for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
             ggml_tensor * src = cgraph->nodes[i]->src[src_idx];
-            if (src && seen_node.find(src) == seen_node.end()) {
-                srcs_extra.push_back(src);
+            if (src && !(src->flags & flag_seen)) {
+                if (extra_idx >= graph->extra.size()) {
+                    graph->extra.push_back({});
+                    res = true;
+                }
+
+                if (!res) {
+                    if (!ggml_cuda_graph_node_properties_match(src, &graph->extra[extra_idx])) {
+                        res = true;
+                    }
+                }
+                ggml_cuda_graph_node_set_properties(&graph->extra[extra_idx], src);
+                extra_idx++;
             }
         }
     }
 
-    if (graph->extra.size() != (size_t) srcs_extra.size()) {
+    if (graph->extra.size() != extra_idx) {
         res = true;
-        graph->extra.resize(srcs_extra.size());
+        graph->extra.resize(extra_idx);
     }
 
-    for (size_t i = 0; i < srcs_extra.size(); ++i) {
-        bool props_match = true;
-
-        if (!res) {
-            props_match = ggml_cuda_graph_node_properties_match(srcs_extra[i], &graph->extra[i]);
-        }
-
-        if (!props_match) {
-            res = true;
-        }
-        ggml_cuda_graph_node_set_properties(&graph->extra[i], srcs_extra[i]);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        cgraph->nodes[i]->flags &= ~flag_seen;
     }
 
     return res;
