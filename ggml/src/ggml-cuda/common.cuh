@@ -1468,6 +1468,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    // When non-null, src1 has already been quantized to Q8_1 in the layout the consumer
+    // expects (block_q8_1_mmq for MMQ, block_q8_1 for MMVQ). The caller (fused kernel)
+    // owns this scratch buffer; mul_mat_q / mul_mat_vec_q must skip their own quantize step.
+    const void * src1_q8_1_pre = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
