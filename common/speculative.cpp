@@ -22,6 +22,7 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NONE,
     COMMON_SPECULATIVE_TYPE_DRAFT,
     COMMON_SPECULATIVE_TYPE_EAGLE3,
+    COMMON_SPECULATIVE_TYPE_MTP,
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
@@ -33,6 +34,7 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
     {"eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3},
+    {"mtp",           COMMON_SPECULATIVE_TYPE_MTP},
     {"ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -583,6 +585,73 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     }
 };
 
+// Qwen3.5/3.6-style Multi-Token Prediction head used as the draft source.
+// The target model stashed its pre-output-norm hidden state on-device during
+// the last main decode; here we call the standalone MTP graph against that
+// cache with the just-sampled token as conditioning. One draft per call (D=1).
+struct common_speculative_state_mtp : public common_speculative_state {
+    llama_context * ctx_tgt;
+    std::vector<float> logits_buf;
+
+    common_speculative_state_mtp(enum common_speculative_type type, llama_context * ctx_tgt)
+        : common_speculative_state(type), ctx_tgt(ctx_tgt) {
+        const llama_model * model = llama_get_model(ctx_tgt);
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        logits_buf.resize(n_vocab);
+
+        // Enable MTP drafting early so prompt-processing decodes populate the
+        // hidden-state cache. Without this the first draft() would see an empty
+        // cache (mtp_n_outputs_last == 0) because begin() runs after prefill.
+        llama_set_mtp_drafting(ctx_tgt, true);
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        GGML_UNUSED(prompt);
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & draft_tokens) override {
+        GGML_UNUSED(params);
+        draft_tokens.clear();
+
+        const llama_model * model = llama_get_model(ctx_tgt);
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        // id_last sits at position prompt_tgt.size() (one past the last prompt token).
+        const llama_pos pos = (llama_pos) prompt_tgt.size();
+
+        // Use the LAST row the previous main decode wrote — that's the h
+        // corresponding to id_last for single-token decodes, or to the last
+        // verified token for a K+1 verification batch.
+        const uint32_t n_hidden = llama_mtp_n_hidden(ctx_tgt);
+        if (n_hidden == 0) {
+            LOG_DBG("%s: no MTP hidden states available yet (n_hidden == 0)\n", __func__);
+            return;
+        }
+        const int32_t i_hidden = (int32_t) n_hidden - 1;
+
+        const int32_t rc = llama_mtp_decode(ctx_tgt, i_hidden, pos, id_last, logits_buf.data());
+        if (rc != 0) {
+            LOG_DBG("%s: llama_mtp_decode rc=%d, no draft\n", __func__, rc);
+            return;
+        }
+
+        // Greedy draft — argmax of MTP logits. Matches vLLM's drafter default.
+        int best = 0;
+        float bv = logits_buf[0];
+        for (int i = 1; i < n_vocab; ++i) {
+            if (logits_buf[i] > bv) { bv = logits_buf[i]; best = i; }
+        }
+        draft_tokens.push_back(best);
+    }
+
+    void accept(uint16_t n_accepted) override {
+        GGML_UNUSED(n_accepted);
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_state_ngram_simple : public common_speculative_state {
     common_ngram_simple_config config;
@@ -904,6 +973,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
         case COMMON_SPECULATIVE_TYPE_DRAFT:         return "draft";
         case COMMON_SPECULATIVE_TYPE_EAGLE3:        return "eagle3";
+        case COMMON_SPECULATIVE_TYPE_MTP:           return "mtp";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram_simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram_map_k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
@@ -940,6 +1010,14 @@ common_speculative * common_speculative_init(
     {
         bool has_draft = !params.mparams_dft.path.empty();
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
+
+        // MTP is available when the target model itself carries a NextN head.
+        // Opt-in explicitly (--speculative-type mtp) or auto-select when the
+        // user didn't ask for another type and the model supports it.
+        const bool model_has_mtp = llama_model_n_mtp(llama_get_model(ctx_tgt)) > 0;
+        const bool has_mtp = model_has_mtp && (
+                params.type == COMMON_SPECULATIVE_TYPE_MTP ||
+                (params.type == COMMON_SPECULATIVE_TYPE_NONE && !has_draft && !has_draft_eagle3));
 
         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
         bool has_ngram_simple  = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
@@ -985,6 +1063,9 @@ common_speculative * common_speculative_init(
         if (has_draft_eagle3) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
         }
+        if (has_mtp) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_MTP, params));
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_state>> impls = {};
@@ -1007,6 +1088,10 @@ common_speculative * common_speculative_init(
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
                 impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_MTP: {
+                impls.push_back(std::make_unique<common_speculative_state_mtp>(config.type, ctx_tgt));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

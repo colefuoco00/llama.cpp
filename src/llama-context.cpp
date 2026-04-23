@@ -3251,6 +3251,10 @@ void llama_set_mtp_drafting(llama_context * ctx, bool enabled) {
     ctx->set_mtp_drafting(enabled);
 }
 
+uint32_t llama_mtp_n_hidden(struct llama_context * ctx) {
+    return ctx->get_mtp_n_outputs_last();
+}
+
 int32_t llama_mtp_decode(struct llama_context * ctx,
                          int32_t                i_hidden,
                          llama_pos              pos,

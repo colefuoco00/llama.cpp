@@ -974,6 +974,11 @@ extern "C" {
     // Requires a model with llama_model_n_mtp() > 0.
     LLAMA_API void llama_set_mtp_drafting(struct llama_context * ctx, bool enabled);
 
+    // Number of hidden-state rows the most recent main llama_decode() wrote into
+    // the MTP h cache. Valid slot indices for llama_mtp_decode are [0, return_value).
+    // Returns 0 when mtp_drafting is disabled or no main decode has run yet.
+    LLAMA_API uint32_t llama_mtp_n_hidden(struct llama_context * ctx);
+
     // Produce Multi-Token Prediction (MTP) draft logits for the next-next token.
     //
     //   i_hidden   : output-slot index from the most recent llama_decode() whose

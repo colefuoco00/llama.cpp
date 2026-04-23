@@ -106,6 +106,9 @@ struct llama_context {
     // floats to logits_out. Returns 0 on success, negative on error.
     int mtp_decode(int32_t i_hidden, llama_pos pos, llama_token tok, float * logits_out);
 
+    // Number of hidden-state rows the most recent main decode wrote to mtp_h_tensor.
+    uint32_t get_mtp_n_outputs_last() const { return mtp_n_outputs_last; }
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
