@@ -974,6 +974,28 @@ extern "C" {
     // Requires a model with llama_model_n_mtp() > 0.
     LLAMA_API void llama_set_mtp_drafting(struct llama_context * ctx, bool enabled);
 
+    // Produce Multi-Token Prediction (MTP) draft logits for the next-next token.
+    //
+    //   i_hidden   : output-slot index from the most recent llama_decode() whose
+    //                hidden state to condition on. Range [0, n_outputs_of_last_decode).
+    //   pos        : absolute position of `tok` (used for RoPE inside MTP's attention).
+    //                For decode-time drafting this is usually (last_decoded_pos + 1).
+    //   tok        : the token whose position sits at `pos` — typically the token
+    //                that was just sampled from main's logits.
+    //   logits_out : caller-allocated buffer of at least n_vocab floats.
+    //
+    // Returns 0 on success, negative on error (see implementation for codes).
+    // Requires the model to have an MTP head (llama_model_n_mtp(model) > 0) and
+    // llama_set_mtp_drafting(ctx, true) before the last main decode.
+    //
+    // Only one MTP module (D = 1) is used per call today; recursion for K > 1
+    // drafts is the caller's responsibility.
+    LLAMA_API int32_t llama_mtp_decode(struct llama_context * ctx,
+                                       int32_t                i_hidden,
+                                       llama_pos              pos,
+                                       llama_token            tok,
+                                       float *                logits_out);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

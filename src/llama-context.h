@@ -101,6 +101,11 @@ struct llama_context {
     // Returns true if the cache is ready for use after this call.
     bool ensure_mtp_h_cache();
 
+    // Run the MTP draft head against the cached hidden state at slot `i_hidden`
+    // with `tok` as the conditioning token at position `pos`. Writes n_vocab
+    // floats to logits_out. Returns 0 on success, negative on error.
+    int mtp_decode(int32_t i_hidden, llama_pos pos, llama_token tok, float * logits_out);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -341,6 +346,15 @@ private:
     ggml_context_ptr        mtp_h_ctx;
     ggml_backend_buffer_ptr mtp_h_buf;
     ggml_tensor *           mtp_h_tensor = nullptr;  // [n_embd, n_outputs_max]
+
+    // Number of h rows the most recent main decode wrote to mtp_h_tensor.
+    // llama_mtp_decode uses this to clamp caller-supplied i_hidden.
+    uint32_t mtp_n_outputs_last = 0;
+
+    // Slot in mtp_h_tensor that the next LLM_GRAPH_TYPE_MTP graph should read
+    // from. Set by llama_mtp_decode before process_ubatch, then plumbed through
+    // llm_graph_params::mtp_h_slot.
+    int32_t  mtp_h_slot_pending = 0;
 
     bool has_evaluated_once = false;
 

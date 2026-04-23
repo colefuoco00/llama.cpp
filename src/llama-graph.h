@@ -32,6 +32,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
+    LLM_GRAPH_TYPE_MTP,       // standalone MTP draft head; reads from cparams.mtp_h_cache
 };
 
 enum llm_ffn_op_type {
@@ -552,6 +553,11 @@ struct llm_graph_params {
     // Shape [n_embd, n_outputs_max]; nullptr when MTP is not active.
     ggml_tensor * mtp_h_cache = nullptr;
 
+    // Starting slot (row index along n_outputs_max) to read from mtp_h_cache when
+    // gtype == LLM_GRAPH_TYPE_MTP. The MTP graph reads `ubatch.n_tokens` rows
+    // beginning at this slot. Default 0 (read the first slot of the cache).
+    int32_t mtp_h_slot = 0;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -768,6 +774,7 @@ struct llm_graph_context {
 
     // Persistent device-side MTP hidden-state cache (see llm_graph_params::mtp_h_cache).
     ggml_tensor *                  mtp_h_cache;
+    const int32_t                  mtp_h_slot;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
