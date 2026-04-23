@@ -612,11 +612,13 @@ private:
                 ggml_tensor * input,
                         int   il);
 
-    // Qwen3.5/3.6 MTP (nextn) head. Consumes the main model's final pre-lm-head
+    // Qwen3.5/3.6 MTP (nextn) head body. Consumes the main model's final pre-lm-head
     // hidden state `h` and a conditioning token id sequence `tok_ids`, runs them
     // through hnorm/enorm → concat → eh_proj → one decoder block (stateless
-    // attention via no_cache_inp) → shared_head_norm → shared lm_head. Returns
-    // logits [n_vocab, n_tokens].
+    // attention via no_cache_inp). Returns the decoder block's output hidden
+    // state h_mtp [n_embd, n_tokens] BEFORE the shared_head_norm/lm_head.
+    // Suitable both as the "h_i^{k-1}" input for the next chained MTP step and
+    // as the input to the shared head for producing draft logits.
     ggml_tensor * build_mtp_head(
                        ggml_tensor * h,
                        ggml_tensor * tok_ids,

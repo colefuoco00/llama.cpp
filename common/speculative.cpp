@@ -614,37 +614,51 @@ struct common_speculative_state_mtp : public common_speculative_state {
             const llama_tokens & prompt_tgt,
             llama_token id_last,
             llama_tokens & draft_tokens) override {
-        GGML_UNUSED(params);
         draft_tokens.clear();
 
         const llama_model * model = llama_get_model(ctx_tgt);
         const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-        // id_last sits at position prompt_tgt.size() (one past the last prompt token).
-        const llama_pos pos = (llama_pos) prompt_tgt.size();
 
-        // Use the LAST row the previous main decode wrote — that's the h
-        // corresponding to id_last for single-token decodes, or to the last
-        // verified token for a K+1 verification batch.
         const uint32_t n_hidden = llama_mtp_n_hidden(ctx_tgt);
         if (n_hidden == 0) {
             LOG_DBG("%s: no MTP hidden states available yet (n_hidden == 0)\n", __func__);
             return;
         }
-        const int32_t i_hidden = (int32_t) n_hidden - 1;
 
-        const int32_t rc = llama_mtp_decode(ctx_tgt, i_hidden, pos, id_last, logits_buf.data());
-        if (rc != 0) {
-            LOG_DBG("%s: llama_mtp_decode rc=%d, no draft\n", __func__, rc);
-            return;
-        }
+        const int32_t n_max = std::max(1, params.n_max);  // number of draft tokens to emit
 
-        // Greedy draft — argmax of MTP logits. Matches vLLM's drafter default.
-        int best = 0;
-        float bv = logits_buf[0];
-        for (int i = 1; i < n_vocab; ++i) {
-            if (logits_buf[i] > bv) { bv = logits_buf[i]; best = i; }
+        // Chain K MTP calls autoregressively. Step 0 reads h from the last main
+        // output slot and conditions on id_last. Each later step reads the
+        // previous MTP call's output h from a scratch slot past the main outputs.
+        //
+        // Scratch slot layout in mtp_h_cache:
+        //   [0, n_hidden)                 = main decode outputs (already present)
+        //   n_hidden + k                  = MTP step k's output h
+        //
+        // Greedy argmax per step matches vLLM's drafter default.
+        llama_token cond_tok = id_last;
+        for (int32_t k = 0; k < n_max; ++k) {
+            const int32_t i_in  = (k == 0) ? (int32_t) n_hidden - 1
+                                           : (int32_t) n_hidden + (k - 1);
+            // Last step doesn't need to write back; save a cpy.
+            const int32_t i_out = (k + 1 < n_max) ? (int32_t) n_hidden + k
+                                                  : -1;
+            const llama_pos pos = (llama_pos) prompt_tgt.size() + k;
+
+            const int32_t rc = llama_mtp_decode(ctx_tgt, i_in, i_out, pos, cond_tok, logits_buf.data());
+            if (rc != 0) {
+                LOG_DBG("%s: llama_mtp_decode rc=%d at step %d, stopping chain\n", __func__, rc, k);
+                return;
+            }
+
+            int best = 0;
+            float bv = logits_buf[0];
+            for (int i = 1; i < n_vocab; ++i) {
+                if (logits_buf[i] > bv) { bv = logits_buf[i]; best = i; }
+            }
+            draft_tokens.push_back(best);
+            cond_tok = best;
         }
-        draft_tokens.push_back(best);
     }
 
     void accept(uint16_t n_accepted) override {

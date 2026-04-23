@@ -512,12 +512,9 @@ ggml_tensor * llm_build_qwen35::build_mtp_head(
     cur = ggml_add(ctx0, cur, ffn_residual);
     cb(cur, "mtp_post_ffn", il);
 
-    cur = build_norm(cur, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, il);
-    cb(cur, "mtp_shared_head_norm", il);
-
-    cur = build_lora_mm(model.output, cur);
-    cb(cur, "mtp_logits", il);
-
+    // Return the MTP block's output hidden (equivalent to h_i^k in the paper).
+    // The caller applies shared_head_norm + lm_head; this tensor is also what's
+    // fed back as h_i^{k-1} for the next chained MTP step.
     return cur;
 }
 
@@ -545,8 +542,25 @@ void llm_build_qwen35::build_standalone_mtp(int * sections) {
     auto * inp_attn = build_attn_inp_no_cache();
 
     const int il = (int) hparams.n_layer - (int) hparams.nextn_predict_layers;
-    ggml_tensor * mtp_logits = build_mtp_head(h, tok_ids, inp_attn, inp_pos, sections, il);
+    ggml_tensor * h_mtp_out = build_mtp_head(h, tok_ids, inp_attn, inp_pos, sections, il);
+    cb(h_mtp_out, "mtp_post_ffn", -1);
 
+    // If requested, cpy h_mtp_out back to the persistent cache at mtp_h_slot_out
+    // so the next chained MTP call can read it as its input h_i^{k-1}.
+    if (mtp_h_slot_out >= 0) {
+        const size_t offset_out = (size_t) mtp_h_slot_out * mtp_h_cache->nb[1];
+        ggml_tensor * dst = ggml_view_2d(ctx0, mtp_h_cache,
+                mtp_h_cache->ne[0], n_tokens,
+                mtp_h_cache->nb[1], offset_out);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_mtp_out, dst));
+    }
+
+    // Shared final norm + shared LM head → draft logits.
+    ggml_tensor * cur = build_norm(h_mtp_out,
+            model.layers[il].nextn.shared_head_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_shared_head_norm", -1);
+
+    ggml_tensor * mtp_logits = build_lora_mm(model.output, cur);
     cb(mtp_logits, "result_output", -1);
     res->t_logits = mtp_logits;
     ggml_build_forward_expand(gf, mtp_logits);

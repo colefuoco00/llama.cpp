@@ -979,24 +979,30 @@ extern "C" {
     // Returns 0 when mtp_drafting is disabled or no main decode has run yet.
     LLAMA_API uint32_t llama_mtp_n_hidden(struct llama_context * ctx);
 
-    // Produce Multi-Token Prediction (MTP) draft logits for the next-next token.
+    // Produce Multi-Token Prediction (MTP) draft logits for the next token beyond
+    // `tok`. Callers that want K > 1 drafts chain the call by feeding each step's
+    // output hidden back into the next step via the mtp_h cache.
     //
-    //   i_hidden   : output-slot index from the most recent llama_decode() whose
-    //                hidden state to condition on. Range [0, n_outputs_of_last_decode).
-    //   pos        : absolute position of `tok` (used for RoPE inside MTP's attention).
-    //                For decode-time drafting this is usually (last_decoded_pos + 1).
-    //   tok        : the token whose position sits at `pos` — typically the token
-    //                that was just sampled from main's logits.
-    //   logits_out : caller-allocated buffer of at least n_vocab floats.
+    //   i_hidden_in  : input slot — where to READ the conditioning hidden state
+    //                  from. For the first chain step this is the last valid row
+    //                  of the main decode's output (typically mtp_n_hidden - 1).
+    //                  For subsequent steps this is the slot that the previous
+    //                  call was told to write its output h into.
+    //   i_hidden_out : output slot — where to WRITE MTP's output h back into the
+    //                  cache. Use a slot past the main decode's outputs (e.g.
+    //                  mtp_n_hidden + k for the k-th chain step). Pass -1 to
+    //                  skip the writeback (last chain step).
+    //   pos          : absolute position of `tok` (used by MTP attention's RoPE).
+    //   tok          : conditioning token — the just-sampled main token for the
+    //                  first step, then each chain step's own argmax.
+    //   logits_out   : caller-allocated buffer of at least n_vocab floats.
     //
-    // Returns 0 on success, negative on error (see implementation for codes).
-    // Requires the model to have an MTP head (llama_model_n_mtp(model) > 0) and
-    // llama_set_mtp_drafting(ctx, true) before the last main decode.
-    //
-    // Only one MTP module (D = 1) is used per call today; recursion for K > 1
-    // drafts is the caller's responsibility.
+    // Returns 0 on success, negative on error.
+    // Requires llama_model_n_mtp(model) > 0 and llama_set_mtp_drafting(ctx, true)
+    // before the main decode that produced the h cache.
     LLAMA_API int32_t llama_mtp_decode(struct llama_context * ctx,
-                                       int32_t                i_hidden,
+                                       int32_t                i_hidden_in,
+                                       int32_t                i_hidden_out,
                                        llama_pos              pos,
                                        llama_token            tok,
                                        float *                logits_out);

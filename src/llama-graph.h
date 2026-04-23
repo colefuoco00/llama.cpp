@@ -558,6 +558,11 @@ struct llm_graph_params {
     // beginning at this slot. Default 0 (read the first slot of the cache).
     int32_t mtp_h_slot = 0;
 
+    // Starting slot to write MTP's output hidden back into mtp_h_cache so it can
+    // be used as input to the next chained MTP step. -1 disables the writeback
+    // (no chaining; the logits are still produced).
+    int32_t mtp_h_slot_out = -1;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -775,6 +780,7 @@ struct llm_graph_context {
     // Persistent device-side MTP hidden-state cache (see llm_graph_params::mtp_h_cache).
     ggml_tensor *                  mtp_h_cache;
     const int32_t                  mtp_h_slot;
+    const int32_t                  mtp_h_slot_out;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
