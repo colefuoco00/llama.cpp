@@ -39,6 +39,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool mtp_drafting;        // dispatch the MTP (NextN) draft head on each decode when enabled
 
     enum llama_pooling_type pooling_type;
 
