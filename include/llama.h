@@ -967,11 +967,11 @@ extern "C" {
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
 
-    // Enable the Multi-Token Prediction (MTP / NextN) draft head on decode passes.
-    // When enabled, each llama_decode() whose batch has outputs for every token
-    // (typical of decode-time drafting and speculative verification) additionally
-    // runs the model's MTP block and produces draft logits readable via
-    // llama_get_mtp_logits_ith(). Requires a model with llama_model_n_mtp() > 0.
+    // Enable the Multi-Token Prediction (MTP / NextN) draft head. When enabled,
+    // the target's main llama_decode() stashes its pre-output-norm hidden state in
+    // a context-owned device-side cache; a subsequent llama_mtp_decode() call
+    // reads that cache and runs the MTP head to produce draft logits.
+    // Requires a model with llama_model_n_mtp() > 0.
     LLAMA_API void llama_set_mtp_drafting(struct llama_context * ctx, bool enabled);
 
     // Set abort callback
@@ -1002,16 +1002,6 @@ extern "C" {
     // in the order they have appeared in the batch.
     // shape: [n_outputs*n_embd]
     // Otherwise, returns NULL.
-    // MTP (Multi-Token Prediction / NextN) draft logits from the i-th output of the
-    // last llama_decode(). Rows are laid out exactly like llama_get_logits_ith(), so
-    // negative indices give the last output row. Returns NULL when:
-    //   - MTP drafting is not enabled on the context (see llama_set_mtp_drafting)
-    //   - the last decode did not dispatch MTP (e.g. prefill with n_tokens > n_outputs)
-    //   - the model has no MTP head (llama_model_n_mtp(model) == 0)
-    //   - `module_idx` is out of range [0, llama_model_n_mtp(model))
-    // Shape: [n_vocab] floats. Valid until the next llama_decode / llama_synchronize.
-    LLAMA_API float * llama_get_mtp_logits_ith(struct llama_context * ctx, int32_t i, int32_t module_idx);
-
     // TODO: deprecate in favor of llama_get_embeddings_ith() (ref: https://github.com/ggml-org/llama.cpp/pull/14853#issuecomment-3113143522)
     LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 

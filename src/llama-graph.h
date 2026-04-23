@@ -545,6 +545,13 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // Persistent device-side cache for the MTP head's input hidden state.
+    // Set by llama_context when mtp_drafting is enabled. The main graph cpy's its
+    // pre-output-norm residual into this tensor at the end of forward; the
+    // LLM_GRAPH_TYPE_MTP builder reads from it as a pre-existing graph input.
+    // Shape [n_embd, n_outputs_max]; nullptr when MTP is not active.
+    ggml_tensor * mtp_h_cache = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -672,7 +679,6 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
-    ggml_tensor * t_mtp_logits  = nullptr; // Qwen3.5/3.6 MTP draft head; [n_vocab, n_outputs] when enabled
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -759,6 +765,9 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    // Persistent device-side MTP hidden-state cache (see llm_graph_params::mtp_h_cache).
+    ggml_tensor *                  mtp_h_cache;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

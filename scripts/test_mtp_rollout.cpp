@@ -108,11 +108,14 @@ int main(int argc, char ** argv) {
         llama_batch_free(b);
 
         float * mlogits = llama_get_logits_ith(ctx, -1);
-        float * tlogits = llama_get_mtp_logits_ith(ctx, -1, 0);
-        if (!mlogits || !tlogits) { fprintf(stderr, "null logits at step %d\n", s); return 1; }
+        if (!mlogits) { fprintf(stderr, "null logits at step %d\n", s); return 1; }
 
         const int main_next = argmax(mlogits, n_vocab);
-        const int mtp_draft = argmax(tlogits, n_vocab);
+        // TODO(M5a.2/M5a.3): replace with llama_mtp_decode(ctx, 0, pos+1, main_next, mtp_logits_buf)
+        //                    then mtp_draft = argmax(mtp_logits_buf). The previous
+        //                    llama_get_mtp_logits_ith() API was removed because the
+        //                    fused MTP dispatch was semantically wrong (off-by-one).
+        const int mtp_draft = main_next;
 
         main_at_step[s] = main_next;
         mtp_at_step[s]  = mtp_draft;

@@ -801,22 +801,6 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
     return j;
 }
 
-float * llama_context::get_mtp_logits_ith(int32_t i) {
-    output_reorder();
-
-    if (mtp_logits.data == nullptr) {
-        return nullptr;
-    }
-
-    try {
-        const int64_t j = output_resolve_row(i);
-        return mtp_logits.data + j*model.vocab.n_tokens();
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: invalid mtp logits id %d, reason: %s\n", __func__, i, err.what());
-        return nullptr;
-    }
-}
-
 float * llama_context::get_logits_ith(int32_t i) {
     output_reorder();
 
@@ -1078,9 +1062,63 @@ void llama_context::set_mtp_drafting(bool value) {
 
     cparams.mtp_drafting = value;
 
+    if (value) {
+        ensure_mtp_h_cache();
+    }
+
     // Toggling changes graph topology (MTP branch present or absent), so force
     // a re-reserve on the next decode.
     sched_need_reserve = true;
+}
+
+bool llama_context::ensure_mtp_h_cache() {
+    if (mtp_h_tensor != nullptr) {
+        return true;
+    }
+    if (model.hparams.nextn_predict_layers == 0) {
+        return false;
+    }
+
+    const int64_t n_embd        = model.hparams.n_embd;
+    const int64_t n_outputs_max = std::max<int64_t>(cparams.n_batch, n_seq_max());
+
+    // Live on the same backend that owns the model output (where h_mtp is computed).
+    auto * buft = ggml_backend_cpu_buffer_type();
+    auto * output_dev = model.dev_output();
+    auto * output_dev_host_buft = output_dev ? ggml_backend_dev_buffer_type(output_dev) : nullptr;
+    if (output_dev_host_buft) {
+        buft = output_dev_host_buft;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 2,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    mtp_h_ctx.reset(ggml_init(params));
+    if (!mtp_h_ctx) {
+        LLAMA_LOG_ERROR("%s: failed to create ggml context for MTP h cache\n", __func__);
+        return false;
+    }
+
+    mtp_h_tensor = ggml_new_tensor_2d(mtp_h_ctx.get(), GGML_TYPE_F32, n_embd, n_outputs_max);
+    ggml_format_name(mtp_h_tensor, "mtp_h_cache");
+
+    mtp_h_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mtp_h_ctx.get(), buft));
+    if (!mtp_h_buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate MTP h cache buffer on %s\n", __func__,
+                ggml_backend_buft_name(buft));
+        mtp_h_tensor = nullptr;
+        mtp_h_ctx.reset();
+        return false;
+    }
+    ggml_backend_buffer_clear(mtp_h_buf.get(), 0);
+
+    LLAMA_LOG_INFO("%s: MTP h cache = %.2f MiB on %s\n", __func__,
+            ggml_backend_buffer_get_size(mtp_h_buf.get()) / 1024.0 / 1024.0,
+            ggml_backend_buft_name(buft));
+
+    return true;
 }
 
 void llama_context::set_warmup(bool value) {
@@ -1780,18 +1818,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        // extract MTP draft logits when the graph produced them this decode
-        auto * t_mtp_logits = res->t_mtp_logits;
-        if (mtp_logits.data && t_mtp_logits && n_outputs > 0) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_logits);
-            GGML_ASSERT(backend_res != nullptr);
-
-            float * mtp_out = mtp_logits.data + n_outputs_prev*n_vocab;
-
-            GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-            GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) mtp_logits.size);
-            ggml_backend_tensor_get_async(backend_res, t_mtp_logits, mtp_out, 0, n_outputs*n_vocab*sizeof(float));
-        }
 
         // extract embeddings
         if (embd.data && t_embd && n_outputs > 0) {
@@ -1953,11 +1979,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count = 0;
 
     logits.size     = has_logits ? n_vocab*n_outputs_max : 0;
-    // MTP logits share the same shape as main logits; only allocated when MTP is
-    // enabled on the context and the model actually has an MTP head.
-    const bool has_mtp_logits =
-            cparams.mtp_drafting && hparams.nextn_predict_layers > 0 && has_logits;
-    mtp_logits.size = has_mtp_logits ? n_vocab*n_outputs_max : 0;
     embd.size       = has_embd ? n_embd_out*n_outputs_max : 0;
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
@@ -1974,8 +1995,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + mtp_logits.size + embd.size + backend_float_count) * sizeof(float) +
-        (                                            backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + backend_float_count) * sizeof(float) +
+        (                          backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -1990,7 +2011,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             // TODO: not needed?
             buf_output = nullptr;
             logits.data = nullptr;
-            mtp_logits.data = nullptr;
             embd.data = nullptr;
         }
 
@@ -2016,11 +2036,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits = has_logits ? buffer_view<float>{output_base, logits.size} : buffer_view<float>{nullptr, 0};
     offset += logits.size * sizeof(float);
-
-    mtp_logits = has_mtp_logits
-            ? buffer_view<float>{(float *) (base + offset), mtp_logits.size}
-            : buffer_view<float>{nullptr, 0};
-    offset += mtp_logits.size * sizeof(float);
 
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
@@ -2217,6 +2232,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.mtp_h_cache =*/ mtp_h_tensor,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3142,15 +3158,6 @@ void llama_set_mtp_drafting(llama_context * ctx, bool enabled) {
     ctx->set_mtp_drafting(enabled);
 }
 
-float * llama_get_mtp_logits_ith(llama_context * ctx, int32_t i, int32_t module_idx) {
-    // Only a single MTP module (D = 1) is produced today; reject other indices up
-    // front so callers notice the limitation rather than getting main-model logits.
-    if (module_idx != 0) {
-        return nullptr;
-    }
-    ctx->synchronize();
-    return ctx->get_mtp_logits_ith(i);
-}
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
