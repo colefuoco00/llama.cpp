@@ -385,3 +385,73 @@ ggml_tensor * llm_build_qwen35::build_layer_ffn(ggml_tensor * cur, const int il)
 
     return cur;
 }
+
+ggml_tensor * llm_build_qwen35::build_mtp_head(
+        ggml_tensor * h,
+        ggml_tensor * tok_ids,
+        llm_graph_input_attn_kv * inp_attn,
+        ggml_tensor * inp_pos,
+        int * sections,
+        int il) {
+    const auto & layer = model.layers[il];
+    GGML_ASSERT(layer.nextn.hnorm   && "MTP hnorm missing");
+    GGML_ASSERT(layer.nextn.enorm   && "MTP enorm missing");
+    GGML_ASSERT(layer.nextn.eh_proj && "MTP eh_proj missing");
+    GGML_ASSERT(layer.nextn.shared_head_norm && "MTP shared_head_norm missing");
+
+    // Paper eq 21:  h' = M_k · [ RMSNorm(h) ; RMSNorm(Emb(t_{i+k})) ]
+    ggml_tensor * h_norm = build_norm(h, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    cb(h_norm, "mtp_hnorm", il);
+
+    ggml_tensor * emb = ggml_get_rows(ctx0, model.tok_embd, tok_ids);
+    cb(emb, "mtp_tok_embd", il);
+
+    ggml_tensor * e_norm = build_norm(emb, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    cb(e_norm, "mtp_enorm", il);
+
+    // Concat along feature dim: [n_embd + n_embd, n_tokens] = [2 * n_embd, n_tokens]
+    ggml_tensor * concat = ggml_concat(ctx0, h_norm, e_norm, 0);
+    cb(concat, "mtp_concat", il);
+
+    ggml_tensor * projected = build_lora_mm(layer.nextn.eh_proj, concat);
+    cb(projected, "mtp_eh_proj", il);
+
+    // TRM_k(h'): one Qwen3.5 full-attention decoder block. Reuses the MTP block's
+    // own attn_q/k/v/o, q_norm, k_norm, ffn_gate/up/down, attn_norm, attn_post_norm,
+    // all loaded by the model loader onto layers[il].
+    //
+    // NOTE (M2 concern): build_layer_attn reads/writes KV cache at slot `il`.
+    // hparams.n_layer_kv_from_start excludes the MTP block, so layer il has no
+    // KV allocated. Dispatch must either extend KV coverage or use a stateless
+    // attention path. See M2 plan.
+    ggml_tensor * inpSA = projected;
+
+    ggml_tensor * cur = build_norm(projected, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_attn_norm", il);
+
+    cur = build_layer_attn(inp_attn, cur, inp_pos, sections, il);
+    cb(cur, "mtp_attn_out", il);
+
+    cur = ggml_add(ctx0, cur, inpSA);
+    cb(cur, "mtp_attn_residual", il);
+
+    ggml_tensor * ffn_residual = cur;
+
+    ggml_tensor * attn_post = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
+    cb(attn_post, "mtp_attn_post_norm", il);
+
+    cur = build_layer_ffn(attn_post, il);
+    cb(cur, "mtp_ffn_out", il);
+
+    cur = ggml_add(ctx0, cur, ffn_residual);
+    cb(cur, "mtp_post_ffn", il);
+
+    // Shared final norm + shared lm_head (no dedicated shared_head_head in Qwen3.5/3.6)
+    cur = build_norm(cur, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_shared_head_norm", il);
+
+    cur = build_lora_mm(model.output, cur);
+    cb(cur, "mtp_logits", il);
+
+    return cur;
+}
