@@ -91,29 +91,17 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
 
     ggml_build_forward_expand(gf, cur);
 
-    // M3: dispatch the MTP head only for decode/verify passes (when every token is
-    // an output). For prefill, n_outputs << n_tokens and MTP is skipped. Gated on
-    // the runtime flag set by llama_set_mtp_drafting(); default is off.
-    const bool mtp_can_dispatch =
-            cparams.mtp_drafting
-            && hparams.nextn_predict_layers > 0
-            && res->t_inp_tokens != nullptr
-            && (int64_t) ubatch.n_tokens == n_outputs;
-
-    if (mtp_can_dispatch) {
-        // Stateless attention for MTP: intra-batch causal mask only, no persistent KV.
-        auto * mtp_attn = build_attn_inp_no_cache();
-
-        ggml_tensor * mtp_logits = build_mtp_head(
-                h_mtp,
-                res->t_inp_tokens,
-                mtp_attn,
-                inp_pos,
-                sections,
-                n_transformer_layers /* MTP block index = first block past the main stack */);
-
-        res->t_mtp_logits = mtp_logits;
-        ggml_build_forward_expand(gf, mtp_logits);
+    // M5a: stash the pre-output-norm residual on the context-owned persistent
+    // device buffer so llama_mtp_decode() can read it without a host roundtrip.
+    // The fused in-graph MTP dispatch from M3 had an off-by-one timing bug
+    // (conditioned on batch input tokens instead of the about-to-be-sampled
+    // main output) and has been removed — MTP now runs as its own graph type.
+    if (cparams.mtp_drafting && hparams.nextn_predict_layers > 0 && mtp_h_cache) {
+        ggml_tensor * cache = mtp_h_cache;
+        // cache has shape [n_embd, n_outputs_max]; write into the first n_outputs slice.
+        ggml_tensor * dst = ggml_view_2d(ctx0, cache, cache->ne[0], n_outputs,
+                cache->nb[1], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_mtp, dst));
     }
 }
 

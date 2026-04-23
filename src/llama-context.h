@@ -63,7 +63,6 @@ struct llama_context {
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();
-    float * get_mtp_logits_ith(int32_t i);
     float * get_logits_ith(int32_t i);
 
     float * get_embeddings();
@@ -96,6 +95,11 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
     void set_mtp_drafting(bool value);
+
+    // Allocate the device-side MTP h cache on the target's output backend.
+    // No-op if already allocated or if the model has no MTP head.
+    // Returns true if the cache is ready for use after this call.
+    bool ensure_mtp_h_cache();
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -260,11 +264,6 @@ private:
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
-    // MTP draft-head output, populated when cparams.mtp_drafting is enabled and the
-    // current ubatch triggers MTP dispatch (n_tokens == n_outputs). Shape matches
-    // `logits`: [n_outputs][n_vocab].
-    buffer_view<float> mtp_logits = {nullptr, 0};
-
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
@@ -334,6 +333,14 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // Persistent device-side cache for the MTP draft head's input hidden state.
+    // Populated at the end of each main decode when cparams.mtp_drafting is set;
+    // consumed by llama_mtp_decode without a host roundtrip. Lives on the same
+    // backend as the model output tensor.
+    ggml_context_ptr        mtp_h_ctx;
+    ggml_backend_buffer_ptr mtp_h_buf;
+    ggml_tensor *           mtp_h_tensor = nullptr;  // [n_embd, n_outputs_max]
 
     bool has_evaluated_once = false;
 
