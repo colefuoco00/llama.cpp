@@ -440,7 +440,12 @@ ggml_tensor * llm_build_qwen35::build_mtp_head(
     ggml_tensor * e_norm = build_norm(emb, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
     cb(e_norm, "mtp_enorm", il);
 
-    ggml_tensor * concat = ggml_concat(ctx0, h_norm, e_norm, 0);
+    // Concat order matches vLLM's Qwen3_5MultiTokenPredictor.forward:
+    //   cat([inputs_embeds, hidden_states], dim=-1)
+    // The fc weight was trained with the token embedding in the first half
+    // and the hidden state in the second half; reversing the order scrambles
+    // the projection.
+    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, 0);
     cb(concat, "mtp_concat", il);
 
     ggml_tensor * projected = build_lora_mm(layer.nextn.eh_proj, concat);
