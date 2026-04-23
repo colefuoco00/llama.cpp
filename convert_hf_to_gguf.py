@@ -5424,13 +5424,64 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+class _Qwen3_5MTPMixin:
+    # Preserves Qwen3.5's MTP head (mtp.* tensors) by remapping onto an extra
+    # decoder-layer index, matching the NextN/MTP convention already used by
+    # GLM4-MoE, Bailingmoe2, DeepSeek2, and Exaone-MoE on the llama.cpp side.
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        n_mtp = self.hparams.get("mtp_num_hidden_layers", 0)
+        if n_mtp:
+            self.block_count = self.hparams["num_hidden_layers"] + n_mtp
+            self.tensor_map  = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        if (n_mtp := self.hparams.get("mtp_num_hidden_layers", 0)):
+            self.gguf_writer.add_nextn_predict_layers(n_mtp)
+
+    _MTP_HEAD_REMAP = {
+        "mtp.fc":                    "eh_proj",
+        "mtp.pre_fc_norm_embedding": "enorm",
+        "mtp.pre_fc_norm_hidden":    "hnorm",
+        "mtp.norm":                  "shared_head.norm",
+    }
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("mtp."):
+            n_main = self.hparams["num_hidden_layers"]
+            n_mtp  = self.hparams.get("mtp_num_hidden_layers", 0)
+            if n_mtp == 0:
+                return
+
+            m = re.match(r"mtp\.layers\.(\d+)\.(.*)", name)
+            if m:
+                inner_bid = int(m.group(1))
+                new_bid   = n_main + inner_bid
+                new_name  = f"model.layers.{new_bid}.{m.group(2)}"
+                yield from super().modify_tensors(data_torch, new_name, new_bid)
+                return
+
+            stem, _, suffix = name.rpartition(".")
+            key = self._MTP_HEAD_REMAP.get(stem)
+            if key is None:
+                logger.warning(f"dropping unknown MTP tensor: {name}")
+                return
+            for nb in range(n_main, n_main + n_mtp):
+                yield from super().modify_tensors(data_torch, f"model.layers.{nb}.{key}.{suffix}", nb)
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
-class Qwen3_5TextModel(_LinearAttentionVReorderBase):
+class Qwen3_5TextModel(_Qwen3_5MTPMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
 
 
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")
-class Qwen3_5MoeTextModel(_LinearAttentionVReorderBase):
+class Qwen3_5MoeTextModel(_Qwen3_5MTPMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
 
