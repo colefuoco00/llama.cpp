@@ -1071,7 +1071,7 @@ void llama_context::set_mtp_drafting(bool value) {
     sched_need_reserve = true;
 }
 
-int llama_context::mtp_decode(int32_t i_hidden, llama_pos pos, llama_token tok, float * logits_out) {
+int llama_context::mtp_decode(int32_t i_hidden_in, int32_t i_hidden_out, llama_pos pos, llama_token tok, float * logits_out) {
     if (!cparams.mtp_drafting) {
         LLAMA_LOG_ERROR("%s: mtp_drafting is not enabled (call llama_set_mtp_drafting(ctx, true))\n", __func__);
         return -1;
@@ -1087,9 +1087,15 @@ int llama_context::mtp_decode(int32_t i_hidden, llama_pos pos, llama_token tok, 
         LLAMA_LOG_ERROR("%s: no main decode has written to the MTP h cache yet\n", __func__);
         return -4;
     }
-    if (i_hidden < 0 || (uint32_t) i_hidden >= mtp_n_outputs_last) {
-        LLAMA_LOG_ERROR("%s: i_hidden %d out of range [0, %u)\n", __func__, i_hidden, mtp_n_outputs_last);
+    if (i_hidden_in < 0 || (int64_t) i_hidden_in >= mtp_h_tensor->ne[1]) {
+        LLAMA_LOG_ERROR("%s: i_hidden_in %d out of range [0, %" PRId64 ")\n",
+                __func__, i_hidden_in, mtp_h_tensor->ne[1]);
         return -5;
+    }
+    if (i_hidden_out >= 0 && (int64_t) i_hidden_out >= mtp_h_tensor->ne[1]) {
+        LLAMA_LOG_ERROR("%s: i_hidden_out %d out of range [0, %" PRId64 ")\n",
+                __func__, i_hidden_out, mtp_h_tensor->ne[1]);
+        return -6;
     }
 
     const auto & vocab   = model.vocab;
@@ -1128,12 +1134,14 @@ int llama_context::mtp_decode(int32_t i_hidden, llama_pos pos, llama_token tok, 
         output_ids[0] = 0;
         n_outputs     = 1;
 
-        mtp_h_slot_pending = i_hidden;
+        mtp_h_slot_pending     = i_hidden_in;
+        mtp_h_slot_out_pending = i_hidden_out;
 
         ggml_status status;
         auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_MTP, /*mctx=*/ nullptr, status);
 
-        mtp_h_slot_pending = 0;
+        mtp_h_slot_pending     = 0;
+        mtp_h_slot_out_pending = -1;
 
         if (!res) {
             rc = (status == GGML_STATUS_ALLOC_FAILED) ? -8 : -9;
@@ -2324,9 +2332,10 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.mtp_h_cache =*/ mtp_h_tensor,
-        /*.mtp_h_slot  =*/ mtp_h_slot_pending,
-        /*.samplers    =*/ sampling.samplers,
+        /*.mtp_h_cache    =*/ mtp_h_tensor,
+        /*.mtp_h_slot     =*/ mtp_h_slot_pending,
+        /*.mtp_h_slot_out =*/ mtp_h_slot_out_pending,
+        /*.samplers       =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3256,11 +3265,12 @@ uint32_t llama_mtp_n_hidden(struct llama_context * ctx) {
 }
 
 int32_t llama_mtp_decode(struct llama_context * ctx,
-                         int32_t                i_hidden,
+                         int32_t                i_hidden_in,
+                         int32_t                i_hidden_out,
                          llama_pos              pos,
                          llama_token            tok,
                          float *                logits_out) {
-    return ctx->mtp_decode(i_hidden, pos, tok, logits_out);
+    return ctx->mtp_decode(i_hidden_in, i_hidden_out, pos, tok, logits_out);
 }
 
 

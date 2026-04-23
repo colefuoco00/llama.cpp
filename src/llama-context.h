@@ -101,10 +101,13 @@ struct llama_context {
     // Returns true if the cache is ready for use after this call.
     bool ensure_mtp_h_cache();
 
-    // Run the MTP draft head against the cached hidden state at slot `i_hidden`
-    // with `tok` as the conditioning token at position `pos`. Writes n_vocab
-    // floats to logits_out. Returns 0 on success, negative on error.
-    int mtp_decode(int32_t i_hidden, llama_pos pos, llama_token tok, float * logits_out);
+    // Run the MTP draft head against the cached hidden state at slot `i_hidden_in`
+    // with `tok` as the conditioning token at position `pos`. If i_hidden_out >= 0,
+    // MTP's output h is copied back to the cache at that slot so the next chained
+    // call can read it. Writes n_vocab floats to logits_out.
+    // Returns 0 on success, negative on error.
+    int mtp_decode(int32_t i_hidden_in, int32_t i_hidden_out,
+                   llama_pos pos, llama_token tok, float * logits_out);
 
     // Number of hidden-state rows the most recent main decode wrote to mtp_h_tensor.
     uint32_t get_mtp_n_outputs_last() const { return mtp_n_outputs_last; }
@@ -357,7 +360,10 @@ private:
     // Slot in mtp_h_tensor that the next LLM_GRAPH_TYPE_MTP graph should read
     // from. Set by llama_mtp_decode before process_ubatch, then plumbed through
     // llm_graph_params::mtp_h_slot.
-    int32_t  mtp_h_slot_pending = 0;
+    int32_t  mtp_h_slot_pending     = 0;
+    // Slot in mtp_h_tensor where the next MTP graph should write its output h
+    // (for chained multi-token drafting). -1 disables the writeback.
+    int32_t  mtp_h_slot_out_pending = -1;
 
     bool has_evaluated_once = false;
 

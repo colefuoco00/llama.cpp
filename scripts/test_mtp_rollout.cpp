@@ -117,7 +117,8 @@ int main(int argc, char ** argv) {
         // Run standalone MTP against the just-produced hidden state, conditioned
         // on main's sampled token. MTP's prediction is for t_{i+2} — i.e., one
         // position past main_next.
-        const int rc = llama_mtp_decode(ctx, /*i_hidden=*/ 0, /*pos=*/ pos + 1,
+        const int rc = llama_mtp_decode(ctx, /*i_hidden_in=*/ 0, /*i_hidden_out=*/ -1,
+                                        /*pos=*/ pos + 1,
                                         /*tok=*/ main_next, mtp_logits_buf.data());
         if (rc != 0) { fprintf(stderr, "llama_mtp_decode rc=%d at step %d\n", rc, s); return 1; }
         const int mtp_draft = argmax(mtp_logits_buf.data(), n_vocab);
