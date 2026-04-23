@@ -625,6 +625,12 @@ private:
                                int * sections,
                                int   il);
 
+    // Standalone MTP draft graph. Reads the persistent mtp_h_cache tensor (filled
+    // by the previous main decode) as `h_i^{k-1}`, pairs it with the conditioning
+    // token(s) from the ubatch, runs build_mtp_head, and exposes result logits on
+    // res->t_logits. Called from the constructor when params.gtype == MTP.
+    void build_standalone_mtp(int * sections);
+
     const llama_model & model;
 };
 

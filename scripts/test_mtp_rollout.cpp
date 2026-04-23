@@ -96,6 +96,8 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> main_at_step(n_steps);
     std::vector<llama_token> mtp_at_step (n_steps);
 
+    std::vector<float> mtp_logits_buf(n_vocab);
+
     for (int s = 0; s < n_steps; ++s) {
         llama_batch b = llama_batch_init(1, 0, 1);
         b.n_tokens     = 1;
@@ -111,11 +113,14 @@ int main(int argc, char ** argv) {
         if (!mlogits) { fprintf(stderr, "null logits at step %d\n", s); return 1; }
 
         const int main_next = argmax(mlogits, n_vocab);
-        // TODO(M5a.2/M5a.3): replace with llama_mtp_decode(ctx, 0, pos+1, main_next, mtp_logits_buf)
-        //                    then mtp_draft = argmax(mtp_logits_buf). The previous
-        //                    llama_get_mtp_logits_ith() API was removed because the
-        //                    fused MTP dispatch was semantically wrong (off-by-one).
-        const int mtp_draft = main_next;
+
+        // Run standalone MTP against the just-produced hidden state, conditioned
+        // on main's sampled token. MTP's prediction is for t_{i+2} — i.e., one
+        // position past main_next.
+        const int rc = llama_mtp_decode(ctx, /*i_hidden=*/ 0, /*pos=*/ pos + 1,
+                                        /*tok=*/ main_next, mtp_logits_buf.data());
+        if (rc != 0) { fprintf(stderr, "llama_mtp_decode rc=%d at step %d\n", rc, s); return 1; }
+        const int mtp_draft = argmax(mtp_logits_buf.data(), n_vocab);
 
         main_at_step[s] = main_next;
         mtp_at_step[s]  = mtp_draft;

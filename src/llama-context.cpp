@@ -1071,6 +1071,92 @@ void llama_context::set_mtp_drafting(bool value) {
     sched_need_reserve = true;
 }
 
+int llama_context::mtp_decode(int32_t i_hidden, llama_pos pos, llama_token tok, float * logits_out) {
+    if (!cparams.mtp_drafting) {
+        LLAMA_LOG_ERROR("%s: mtp_drafting is not enabled (call llama_set_mtp_drafting(ctx, true))\n", __func__);
+        return -1;
+    }
+    if (!mtp_h_tensor) {
+        LLAMA_LOG_ERROR("%s: MTP h cache is not allocated\n", __func__);
+        return -2;
+    }
+    if (!logits_out) {
+        return -3;
+    }
+    if (mtp_n_outputs_last == 0) {
+        LLAMA_LOG_ERROR("%s: no main decode has written to the MTP h cache yet\n", __func__);
+        return -4;
+    }
+    if (i_hidden < 0 || (uint32_t) i_hidden >= mtp_n_outputs_last) {
+        LLAMA_LOG_ERROR("%s: i_hidden %d out of range [0, %u)\n", __func__, i_hidden, mtp_n_outputs_last);
+        return -5;
+    }
+
+    const auto & vocab   = model.vocab;
+    const auto & hparams = model.hparams;
+    const int64_t n_vocab = vocab.n_tokens();
+    const int64_t n_embd  = hparams.n_embd_inp();
+
+    // Construct a single-token batch manually. Owns its own storage.
+    llama_batch batch = llama_batch_init(1, 0, /*n_seq_max=*/ 1);
+    batch.n_tokens     = 1;
+    batch.token[0]     = tok;
+    batch.pos[0]       = pos;
+    batch.n_seq_id[0]  = 1;
+    batch.seq_id[0][0] = 0;
+    batch.logits[0]    = 1;
+
+    const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+
+    int rc = 0;
+    if (!balloc->init(batch, vocab, /*memory=*/ nullptr, n_embd, n_seq_max, /*all_logits=*/ true)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        rc = -6;
+        goto done;
+    }
+
+    {
+        const uint32_t n_tokens = balloc->get_n_tokens();
+        const llama_ubatch ubatch = balloc->split_simple(n_tokens);
+
+        sched_reserve();
+
+        if (output_reserve(1) < 1) {
+            rc = -7;
+            goto done;
+        }
+        output_ids[0] = 0;
+        n_outputs     = 1;
+
+        mtp_h_slot_pending = i_hidden;
+
+        ggml_status status;
+        auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_MTP, /*mctx=*/ nullptr, status);
+
+        mtp_h_slot_pending = 0;
+
+        if (!res) {
+            rc = (status == GGML_STATUS_ALLOC_FAILED) ? -8 : -9;
+            goto done;
+        }
+
+        auto * t_logits = res->get_logits();
+        if (!t_logits) {
+            rc = -10;
+            goto done;
+        }
+
+        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+        GGML_ASSERT(backend_res != nullptr);
+        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_vocab * sizeof(float));
+        synchronize();
+    }
+
+done:
+    llama_batch_free(batch);
+    return rc;
+}
+
 bool llama_context::ensure_mtp_h_cache() {
     if (mtp_h_tensor != nullptr) {
         return true;
@@ -1898,6 +1984,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
 
+    // Track how many h rows the main graph wrote into mtp_h_tensor this decode;
+    // llama_mtp_decode clamps caller-supplied i_hidden against this.
+    if (cparams.mtp_drafting && mtp_h_tensor) {
+        mtp_n_outputs_last = n_outputs_all;
+    }
+
     // set output mappings
     if (n_outputs > 0) {
         bool sorted_output = true;
@@ -2233,6 +2325,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.mtp_h_cache =*/ mtp_h_tensor,
+        /*.mtp_h_slot  =*/ mtp_h_slot_pending,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3156,6 +3249,14 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_set_mtp_drafting(llama_context * ctx, bool enabled) {
     ctx->set_mtp_drafting(enabled);
+}
+
+int32_t llama_mtp_decode(struct llama_context * ctx,
+                         int32_t                i_hidden,
+                         llama_pos              pos,
+                         llama_token            tok,
+                         float *                logits_out) {
+    return ctx->mtp_decode(i_hidden, pos, tok, logits_out);
 }
 
 

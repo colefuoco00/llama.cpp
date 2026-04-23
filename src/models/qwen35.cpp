@@ -11,6 +11,14 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
+    // LLM_GRAPH_TYPE_MTP dispatches to the standalone MTP draft graph instead of
+    // the main transformer stack. The main decode populates mtp_h_cache; this
+    // path reads from it and runs only the MTP block + LM head.
+    if (params.gtype == LLM_GRAPH_TYPE_MTP) {
+        build_standalone_mtp(sections);
+        return;
+    }
+
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -511,4 +519,35 @@ ggml_tensor * llm_build_qwen35::build_mtp_head(
     cb(cur, "mtp_logits", il);
 
     return cur;
+}
+
+void llm_build_qwen35::build_standalone_mtp(int * sections) {
+    GGML_ASSERT(mtp_h_cache && "llama_mtp_decode requires mtp_h_cache; call llama_set_mtp_drafting(true) before llama_decode");
+    GGML_ASSERT(hparams.nextn_predict_layers > 0 && "model has no MTP head");
+
+    // Main graph populates mtp_h_cache with shape [n_embd, n_outputs_max]. This
+    // decode's ubatch requests n_tokens rows starting at mtp_h_slot (set by the
+    // llama_context based on the prior main decode's n_outputs).
+    const size_t offset = (size_t) mtp_h_slot * mtp_h_cache->nb[1];
+    ggml_tensor * h = ggml_view_2d(ctx0, mtp_h_cache,
+            mtp_h_cache->ne[0], n_tokens,
+            mtp_h_cache->nb[1], offset);
+    cb(h, "mtp_h_input", -1);
+
+    // Conditioning token input (standard build_inp_embd produces the embeddings;
+    // we want the raw token ids for build_mtp_head's enorm(Emb(tok_ids)) path).
+    (void) build_inp_embd(model.tok_embd);   // registers inp_tokens in res->t_inp_tokens
+    ggml_tensor * tok_ids = res->t_inp_tokens;
+    GGML_ASSERT(tok_ids && "MTP graph requires token input");
+
+    ggml_tensor * inp_pos = build_inp_pos();
+
+    auto * inp_attn = build_attn_inp_no_cache();
+
+    const int il = (int) hparams.n_layer - (int) hparams.nextn_predict_layers;
+    ggml_tensor * mtp_logits = build_mtp_head(h, tok_ids, inp_attn, inp_pos, sections, il);
+
+    cb(mtp_logits, "result_output", -1);
+    res->t_logits = mtp_logits;
+    ggml_build_forward_expand(gf, mtp_logits);
 }
