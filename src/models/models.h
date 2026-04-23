@@ -614,16 +614,16 @@ private:
 
     // Qwen3.5/3.6 MTP (nextn) head. Consumes the main model's final pre-lm-head
     // hidden state `h` and a conditioning token id sequence `tok_ids`, runs them
-    // through hnorm/enorm → concat → eh_proj → one decoder block → shared_head_norm
-    // → shared lm_head. Returns logits [n_vocab, n_tokens]. Not wired into forward()
-    // yet; exposed so M2 can dispatch and inspect via GGML_SCHED_DEBUG=2.
+    // through hnorm/enorm → concat → eh_proj → one decoder block (stateless
+    // attention via no_cache_inp) → shared_head_norm → shared lm_head. Returns
+    // logits [n_vocab, n_tokens].
     ggml_tensor * build_mtp_head(
-                ggml_tensor * h,
-                ggml_tensor * tok_ids,
-    llm_graph_input_attn_kv * inp_attn,
-                ggml_tensor * inp_pos,
-                        int * sections,
-                        int   il);
+                       ggml_tensor * h,
+                       ggml_tensor * tok_ids,
+    llm_graph_input_attn_no_cache * inp_attn,
+                       ggml_tensor * inp_pos,
+                               int * sections,
+                               int   il);
 
     const llama_model & model;
 };

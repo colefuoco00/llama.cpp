@@ -53,6 +53,7 @@ llama_context::llama_context(
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
+    cparams.mtp_drafting     = false;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -800,6 +801,22 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
     return j;
 }
 
+float * llama_context::get_mtp_logits_ith(int32_t i) {
+    output_reorder();
+
+    if (mtp_logits.data == nullptr) {
+        return nullptr;
+    }
+
+    try {
+        const int64_t j = output_resolve_row(i);
+        return mtp_logits.data + j*model.vocab.n_tokens();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid mtp logits id %d, reason: %s\n", __func__, i, err.what());
+        return nullptr;
+    }
+}
+
 float * llama_context::get_logits_ith(int32_t i) {
     output_reorder();
 
@@ -1049,6 +1066,20 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
+    sched_need_reserve = true;
+}
+
+void llama_context::set_mtp_drafting(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    if (cparams.mtp_drafting == value) {
+        return;
+    }
+
+    cparams.mtp_drafting = value;
+
+    // Toggling changes graph topology (MTP branch present or absent), so force
+    // a re-reserve on the next decode.
     sched_need_reserve = true;
 }
 
@@ -1749,6 +1780,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // extract MTP draft logits when the graph produced them this decode
+        auto * t_mtp_logits = res->t_mtp_logits;
+        if (mtp_logits.data && t_mtp_logits && n_outputs > 0) {
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_logits);
+            GGML_ASSERT(backend_res != nullptr);
+
+            float * mtp_out = mtp_logits.data + n_outputs_prev*n_vocab;
+
+            GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+            GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) mtp_logits.size);
+            ggml_backend_tensor_get_async(backend_res, t_mtp_logits, mtp_out, 0, n_outputs*n_vocab*sizeof(float));
+        }
+
         // extract embeddings
         if (embd.data && t_embd && n_outputs > 0) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
@@ -1908,8 +1952,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_float_count = 0;
     size_t backend_token_count = 0;
 
-    logits.size = has_logits ? n_vocab*n_outputs_max : 0;
-    embd.size   = has_embd ? n_embd_out*n_outputs_max : 0;
+    logits.size     = has_logits ? n_vocab*n_outputs_max : 0;
+    // MTP logits share the same shape as main logits; only allocated when MTP is
+    // enabled on the context and the model actually has an MTP head.
+    const bool has_mtp_logits =
+            cparams.mtp_drafting && hparams.nextn_predict_layers > 0 && has_logits;
+    mtp_logits.size = has_mtp_logits ? n_vocab*n_outputs_max : 0;
+    embd.size       = has_embd ? n_embd_out*n_outputs_max : 0;
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
@@ -1925,8 +1974,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + backend_float_count) * sizeof(float) +
-        (                          backend_token_count) * sizeof(llama_token);
+        (logits.size + mtp_logits.size + embd.size + backend_float_count) * sizeof(float) +
+        (                                            backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -1941,6 +1990,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             // TODO: not needed?
             buf_output = nullptr;
             logits.data = nullptr;
+            mtp_logits.data = nullptr;
             embd.data = nullptr;
         }
 
@@ -1966,6 +2016,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits = has_logits ? buffer_view<float>{output_base, logits.size} : buffer_view<float>{nullptr, 0};
     offset += logits.size * sizeof(float);
+
+    mtp_logits = has_mtp_logits
+            ? buffer_view<float>{(float *) (base + offset), mtp_logits.size}
+            : buffer_view<float>{nullptr, 0};
+    offset += mtp_logits.size * sizeof(float);
 
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
@@ -3081,6 +3136,20 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_mtp_drafting(llama_context * ctx, bool enabled) {
+    ctx->set_mtp_drafting(enabled);
+}
+
+float * llama_get_mtp_logits_ith(llama_context * ctx, int32_t i, int32_t module_idx) {
+    // Only a single MTP module (D = 1) is produced today; reject other indices up
+    // front so callers notice the limitation rather than getting main-model logits.
+    if (module_idx != 0) {
+        return nullptr;
+    }
+    ctx->synchronize();
+    return ctx->get_mtp_logits_ith(i);
 }
 
 void llama_synchronize(llama_context * ctx) {

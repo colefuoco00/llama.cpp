@@ -63,6 +63,7 @@ struct llama_context {
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();
+    float * get_mtp_logits_ith(int32_t i);
     float * get_logits_ith(int32_t i);
 
     float * get_embeddings();
@@ -94,6 +95,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    void set_mtp_drafting(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -257,6 +259,11 @@ private:
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
+
+    // MTP draft-head output, populated when cparams.mtp_drafting is enabled and the
+    // current ubatch triggers MTP dispatch (n_tokens == n_outputs). Shape matches
+    // `logits`: [n_outputs][n_vocab].
+    buffer_view<float> mtp_logits = {nullptr, 0};
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
