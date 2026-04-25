@@ -1,6 +1,6 @@
 #include "gated_delta_net.cuh"
 
-template <int S_v, bool KDA>
+template <int S_v, bool KDA, bool EMIT>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -37,7 +37,8 @@ gated_delta_net_cuda(const float * q,
     float *       attn_data        = dst;
     float *       state            = dst + attn_score_elems;
 
-    const int64_t state_offset = (sequence * H + h_idx) * S_v * S_v;
+    const int64_t state_offset       = (sequence * H + h_idx) * S_v * S_v;
+    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs; // EMIT only
     state += state_offset;
     curr_state += state_offset + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
@@ -135,17 +136,30 @@ gated_delta_net_cuda(const float * q,
         }
 
         attn_data += S_v * H;
+
+        // EMIT: snapshot post-token-t state. Slot t holds state after token t;
+        // slot T-1 ends up holding the final state (matches CPU emit semantics).
+        if constexpr (EMIT) {
+            float * snap_t = (dst + attn_score_elems) + t * state_size_per_snap + state_offset;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                snap_t[col * S_v + i] = s_shard[r];
+            }
+        }
     }
 
-    // Write state back to global memory (transposed layout)
+    // Non-emit: write final state. (Emit mode already wrote it as snap T-1.)
+    if constexpr (!EMIT) {
 #pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i          = r * warp_size + lane;
-        state[col * S_v + i] = s_shard[r];
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i          = r * warp_size + lane;
+            state[col * S_v + i] = s_shard[r];
+        }
     }
 }
 
-template <bool KDA>
+template <bool KDA, bool EMIT>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
@@ -169,26 +183,26 @@ static void launch_gated_delta_net(
 
     switch (S_v) {
         case 16:
-            gated_delta_net_cuda<16, KDA><<<grid_dims, block_dims, 0, stream>>>(
+            gated_delta_net_cuda<16, KDA, EMIT><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
         case 32:
-            gated_delta_net_cuda<32, KDA><<<grid_dims, block_dims, 0, stream>>>(
+            gated_delta_net_cuda<32, KDA, EMIT><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
         case 64: {
-            gated_delta_net_cuda<64, KDA><<<grid_dims, block_dims, 0, stream>>>(
+            gated_delta_net_cuda<64, KDA, EMIT><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
         }
         case 128: {
-            gated_delta_net_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
+            gated_delta_net_cuda<128, KDA, EMIT><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
@@ -261,13 +275,27 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     cudaStream_t stream = ctx.stream();
 
+    const bool emit = (((const int32_t *) dst->op_params)[0] != 0);
+
     if (kda) {
-        launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        if (emit) {
+            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        } else {
+            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        }
     } else {
-        launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        if (emit) {
+            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        } else {
+            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        }
     }
 }

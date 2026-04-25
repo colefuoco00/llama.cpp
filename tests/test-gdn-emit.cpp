@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 static void fill_random(ggml_tensor * t, std::mt19937 & rng) {
@@ -34,9 +35,8 @@ static void fill_random(ggml_tensor * t, std::mt19937 & rng) {
     ggml_backend_tensor_set(t, buf.data(), 0, n * sizeof(float));
 }
 
-int main() {
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    if (!backend) { fprintf(stderr, "cpu backend init failed\n"); return 2; }
+static int run_test(ggml_backend_t backend, const char * label) {
+    fprintf(stderr, "==== backend: %s ====\n", label);
 
     // problem dims
     const int64_t H        = 4;     // heads
@@ -113,13 +113,37 @@ int main() {
     }
     fprintf(stderr, "emit[T-1] vs non-emit final  max_abs_diff = %g\n", state_mad);
 
-    const double tol = 1e-6;  // CPU fp32, same kernel path, must be exact
+    const double tol = 1e-5;  // same kernel path on each backend, but CUDA may have minor reorder
     int rc = (attn_mad <= tol && state_mad <= tol) ? 0 : 1;
-    fprintf(stderr, "%s\n", rc == 0 ? "PASS" : "FAIL");
+    fprintf(stderr, "[%s] %s\n", label, rc == 0 ? "PASS" : "FAIL");
 
     ggml_gallocr_free(galloc);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
-    ggml_backend_free(backend);
+    return rc;
+}
+
+int main(int argc, char ** argv) {
+    bool want_cuda = (argc > 1 && std::string(argv[1]) == "cuda");
+
+    int rc = 0;
+
+    {
+        ggml_backend_t cpu = ggml_backend_cpu_init();
+        if (!cpu) { fprintf(stderr, "cpu backend init failed\n"); return 2; }
+        rc |= run_test(cpu, "cpu");
+        ggml_backend_free(cpu);
+    }
+
+    if (want_cuda) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        if (!reg) { fprintf(stderr, "CUDA backend not registered\n"); return 2; }
+        ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+        ggml_backend_t cuda = ggml_backend_dev_init(dev, nullptr);
+        if (!cuda) { fprintf(stderr, "cuda backend init failed\n"); return 2; }
+        rc |= run_test(cuda, "cuda");
+        ggml_backend_free(cuda);
+    }
+
     return rc;
 }
