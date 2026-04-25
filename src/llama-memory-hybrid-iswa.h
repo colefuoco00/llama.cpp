@@ -34,6 +34,7 @@ public:
                  uint32_t   rs_size,
                             /* common */
                  uint32_t   n_seq_max,
+                 uint32_t   n_spec_max,
                      bool   offload,
                      bool   unified,
                             /* layer filters */

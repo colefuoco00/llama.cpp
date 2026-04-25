@@ -24,12 +24,16 @@ llama_memory_recurrent::llama_memory_recurrent(
                      bool   offload,
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
+                 uint32_t   n_spec_max,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer;
 
     head = 0;
     size = mem_size;
     used = 0;
+
+    n_spec = n_spec_max;
+    active_slots.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -92,8 +96,11 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), mem_size);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), mem_size);
+        // axis-1 size = mem_size * (1 + n_spec). Slot k of cell c lives at
+        // flat row k * mem_size + c. Slot 0 keeps current semantics.
+        const uint32_t n_rows = mem_size * (1 + n_spec);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
@@ -141,7 +148,6 @@ void llama_memory_recurrent::clear(bool data) {
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    //printf("[DEBUG] calling llama_memory_recurrent::seq_rm` with `seq_id=%d, p0=%d, p1=%d`\n", seq_id, p0, p1);
     uint32_t new_head = size;
 
     if (p0 < 0) {
@@ -161,10 +167,20 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (0 <= seq_id) {
         int32_t & tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
-            const auto & cell = cells[tail_id];
-            // partial intersection is invalid if it includes the final pos
+            auto & cell = cells[tail_id];
+            // partial intersection that includes the final pos: try slot
+            // select if a per-token snapshot is available within rollback
+            // distance. Recurrent kernels write state-after-(T-s) tokens to
+            // slot `s` during a multi-token decode (HYBRID_PARTIAL_SEQRM_PLAN);
+            // here we just look up which slot corresponds to the requested
+            // truncation and arm `active_slots[seq]` for the next graph build.
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: partial intersection is invalid, so returning false, p0 = %d, cell.pos = %d, p1 = %d\n", p0, cell.pos, p1);
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                if (rollback >= 1 && rollback <= (llama_pos) n_spec) {
+                    set_active_slot(seq_id, (uint32_t) rollback);
+                    cell.pos = p0 - 1;
+                    return true;
+                }
                 return false;
             }
             // invalidate tails which will be cleared
@@ -366,6 +382,20 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return result;
+}
+
+void llama_memory_recurrent::set_active_slot(llama_seq_id seq_id, uint32_t slot) {
+    if (seq_id < 0 || (size_t) seq_id >= active_slots.size()) {
+        return;
+    }
+    active_slots[seq_id] = (slot > n_spec) ? n_spec : slot;
+}
+
+uint32_t llama_memory_recurrent::get_active_slot(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (size_t) seq_id >= active_slots.size()) {
+        return 0;
+    }
+    return active_slots[seq_id];
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -1159,5 +1189,28 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
-    return  mem->cells[i + mem->head].src0;
+    const uint32_t cell_idx = i + mem->head;
+    const int32_t  src0     = mem->cells[cell_idx].src0;
+
+    if (mem->n_spec == 0) {
+        return src0;
+    }
+
+    // Slot widening (HYBRID_PARTIAL_SEQRM_PLAN phase 1). active_slots[seq]
+    // holds the rollback slot index set by seq_rm's partial path; when
+    // non-zero, the graph reads from row (slot * mem_size + cell_idx) so the
+    // next decode resumes from the per-token snapshot rather than the
+    // committed state. One-shot consume: clear after read so subsequent
+    // graph builds see slot 0 unless another seq_rm partial fires.
+    uint32_t slot = 0;
+    if (!mem->cells[cell_idx].seq_id.empty()) {
+        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
+        if (seq >= 0 && (size_t) seq < mem->active_slots.size()) {
+            slot = mem->active_slots[seq];
+            if (slot != 0) {
+                mem->active_slots[seq] = 0;
+            }
+        }
+    }
+    return (int32_t)(slot * mem->size) + src0;
 }

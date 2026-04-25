@@ -23,6 +23,7 @@ public:
                          bool   offload,
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
+                     uint32_t   n_spec_max,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -68,6 +69,20 @@ public:
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
+
+    // Number of speculative-rollback slots per cell. Tensors are allocated as
+    // (1 + n_spec) groups along axis 1; slot 0 is the active/committed state
+    // (matching pre-widening semantics), slots 1..n_spec hold per-token
+    // intermediates emitted by recurrent kernels during a multi-token verify.
+    uint32_t n_spec = 0;
+    // Per-sequence active-slot selector (size n_seq_max). Defaults to 0 so all
+    // existing read paths see slot 0. seq_rm partial sets this to the slot
+    // representing "state after p0-1 tokens" so the next decode reads from it.
+    std::vector<uint32_t> active_slots;
+
+    void     set_active_slot(llama_seq_id seq_id, uint32_t slot);
+    uint32_t get_active_slot(llama_seq_id seq_id) const;
+    uint32_t get_n_spec()      const { return n_spec; }
 
     // computed before each graph build
     uint32_t n = 0;

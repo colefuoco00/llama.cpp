@@ -1,211 +1,334 @@
-# Hybrid-memory partial `seq_rm` for speculative decoding
+# Multi-slot recurrent memory (foundation for hybrid spec decode)
 
-**Status:** design, not yet implemented
-**Author of this plan:** handoff doc; read before implementing
-**Goal:** make spec-decoding actually accelerate hybrid attention+SSM models (Qwen3.5/3.6, Qwen3-Next, Mamba variants)
+**Status:** plan, not yet implemented. Replaces an earlier patches-on-server design.
+**Goal:** give the recurrent half of hybrid memory the structural primitive it
+needs for correct, low-cost rollback during speculative decoding —
+**(1 + n_draft_max)** state slots per sequence, with kernels that emit
+per-token intermediates into those slots during a verify batch. This is the
+mechanism vLLM uses for SSM/linear-attention spec decode and the only path
+that lets us roll back to "after M accepted drafts" without re-decoding
+already-accepted tokens.
 
----
-
-## 1. The problem
-
-Speculative decoding works by:
-
-1. Target decodes a batch `[last_accepted, d1, …, dK]` in one forward pass (K+1 positions).
-2. Rejection-samples each draft. Accepts the first `M ≤ K` drafts; resamples at the rejection point.
-3. Next iteration: continue from after the last accepted token.
-
-For step 3 to be cheap, the context has to be able to **roll back** the last `K - M` positions' worth of state. For plain attention, this is a pointer move: `num_computed_tokens -= K - M`; the orphaned KV blocks get overwritten on the next write. Zero work.
-
-For **SSM / linear-attention / GDN / Mamba** layers, state is recurrent. The "state after K+1 tokens" is a function of all K+1 tokens. You cannot undo the last step by pointer arithmetic. You either need:
-
-- A snapshot you can restore to, **or**
-- The per-token intermediate states, so you can pick slot[M].
-
-llama.cpp's `llama_memory_recurrent` (`src/llama-memory-recurrent.*`) today supports **neither**. `seq_rm(seq, p0, -1)` with `p1 == -1` is the only form it accepts, and for recurrent memory that's effectively "clear the whole sequence." Any mid-sequence truncation fails, which makes `common_context_can_seq_rm()` return `COMMON_CONTEXT_SEQ_RM_TYPE_FULL`.
-
-The server's fallback when it sees `TYPE_FULL` is the **checkpoint path** (`tools/server/server-context.cpp`, see `spec_ckpt` / `server_get_checkpoint` / `llama_state_seq_set_data_ext`):
-
-1. Save full per-sequence state to host memory (a dump of the KV + SSM + conv state).
-2. Do the verify batch.
-3. On reject: restore the full state, set `spec_draft = [target's resampled token]`, and **loop the verify** — doing *another* batch=K+1 target decode that trivially accepts (since "draft" is now target's own sample).
-
-Cost per reject: **two** batch=K+1 target decodes instead of one. On Qwen3.5's hybrid-SSM architecture where batch=2 takes roughly 2× batch=1 (SSM layers don't parallelize inside a sequence), this doubles the reject path cost and almost entirely cancels the spec-decode speedup:
-
-```
-baseline (no spec):  4.80 tok/s
-K=1:                 4.87 tok/s  (+1%)   ← theoretical 1.67×, achieved ~1.01×
-K=2:                 5.26 tok/s  (+10%)
-K=3:                 5.10 tok/s  (+6%)
-K=4:                 4.63 tok/s  (-4%)
-```
+Specifically scoped to qwen3.5/3.6 GDN (the linear-attention model we have on
+disk and the one the earlier in-tree attempt targeted). Mamba SSM-scan and
+RWKV are explicitly out of scope until this lands cleanly for GDN.
 
 ---
 
-## 2. What vLLM does, in one paragraph
+## 1. Why the slot primitive, not server-side patches
 
-For each drafter-equipped request, vLLM allocates **`1 + num_speculative_tokens` state slots per SSM/linear-attention layer**, not one. During the target's single batched forward over the K+1 positions, the SSM / `causal_conv1d` / GDN kernels write **every intermediate per-token state into its own slot** (not overwriting a single slot). After the batched decode, sampling produces `num_accepted_tokens`. The **next** step's kernel reads its initial state from `slot[num_accepted - 1]` — no memcpy, no re-forward. Rollback is a single index load.
+We spent a session chasing two server-layer fixes — a host→device snapshot of
+the recurrent state, and a "reverify-elimination" that single-token-redecodes
+after restore. Both leave the structural problem untouched: **after a partial
+accept of M drafts out of K, the recurrent half is at pos `P + K + 1` and there
+is no way to recover the state at pos `P + M + 1` other than re-running the
+target.** Every server-layer patch ends up paying that re-run.
 
-References (vLLM main as of this plan's date):
+vLLM avoids it by allocating `1 + num_speculative_tokens` state slots per
+SSM/linear-attention layer per sequence, writing each per-token intermediate
+state into its own slot during the batched verify, and reading
+`slot[num_accepted - 1]` on the next decode. Rollback is a **select**, not a
+restore. No memcpy, no re-forward.
 
-- Slot allocation: `vllm/v1/attention/backends/mamba_attn.py` (`self.state_indices_tensor_d = torch.empty((..., 1 + self.num_spec_tokens), ...)`)
-- Kernel-level indexed read: `vllm/model_executor/layers/mamba/ops/mamba_ssm.py`, look for `num_accepted_tokens_ptr` and `init_token_idx = max(num_accepted - 1, 0)`.
-- Conv state equivalent: `vllm/model_executor/layers/mamba/ops/causal_conv1d.py`.
-- Linear-attention / GDN (what Qwen3.5 uses): `vllm/model_executor/layers/mamba/gdn_linear_attn.py`, `fused_sigmoid_gating_delta_rule_update(..., num_accepted_tokens=…)`.
-- Plain-attention rollback (pointer move): `vllm/v1/core/sched/scheduler.py`, `request.num_computed_tokens -= num_rejected`.
-
-vLLM's mechanism for SSM rollback is **select, not restore**. No per-token snapshot; the snapshots are produced by the scan itself.
-
----
-
-## 3. The simplifying observation about our kernels
-
-In llama.cpp, `ggml_ssm_scan` and `ggml_ssm_conv` *already compute per-token intermediate states internally* (they have to — it's a scan). They just don't return them. The work to expose them as output tensors is layout plumbing, not new math. Same for the linear-attention ops used by Qwen3.5 (`build_layer_attn_linear` in `src/models/qwen35.cpp`, `build_delta_net` from `llm_build_delta_net_base`).
-
-This keeps the kernel change scoped to "emit an additional tensor" rather than anything algorithmic.
+The kernels in `ggml/src/ggml-cuda/ssm-scan.cu`, `ssm-conv.cu`, and the GDN
+ops in `ggml/src/ggml-cuda/gated_delta_net.cu` already compute these
+intermediates internally — they're produced by the scan. Today they only
+return the final state. The work is layout plumbing, not new math.
 
 ---
 
-## 4. Proposed implementation, staged
+## 2. Why earlier attempts at this failed (read before designing)
 
-### Stage 1 — snapshot+restore for all-or-nothing rollback *(~1 week)*
+`findings.md` in the repo root documents an in-tree attempt that built most of
+this and hit an unresolved long-prompt spiral. Key non-trivial findings:
 
-**Goal:** for the K=1 spec path (and any K>1 case where either all-accepted or all-rejected), eliminate the checkpoint-reverify loop. Accept that partial K>1 rejects still use the existing checkpoint path for now.
+- **Per-slot bit-identity does not imply end-to-end correctness.** The prior
+  attempt's `ggml_gated_delta_net_emit` kernel produced slot-N contents that
+  were bit-identical to a truncated non-emit run (`scripts/test_gdn_emit.cpp`
+  at Qwen3.6 sizes). Yet long-prompt generation collapsed into attractors
+  ("people people people…" / "of the of the…") on both CPU and CUDA.
+- **The collapse is uniquely triggered when `s_copy` returns a slot index
+  > 0** — i.e., when the rollback path actually fires. Widening the tensor
+  alone, or running the emit kernel without rollback reads, was coherent.
+- **The chunking and AR (autoregressive) GDN kernels live on different
+  numerical trajectories** — max-abs-diff 19.65 on activations of order 1
+  between Fused-AR and Fused-CH on Qwen3.6 sizes. This is not FP noise.
+  Master's normal generation path uses Fused-AR; the verify batch (T > 1)
+  uses chunking; emit naturally writes from the chunking path. Every
+  partial-accept rollback pulls the seq onto trajectory A while master's
+  per-token decode lives on trajectory B. They drift, output collapses.
+- **The widened tensor itself perturbed prefill state under `n_parallel > 1`**
+  — even with emit disabled and rollback disabled, the mere existence of
+  more rows in `r_l`/`s_l` shifted byte-level state during prompt processing.
+  Suspected cause: `nb[1]` / find_slot indexing assumptions that hold when
+  `mem_size = 1` but break when wider. Unconfirmed.
 
-Changes:
+These three observations bound the plan: any phase that doesn't have a
+proven fix for each is not ready to land.
 
-| file | change |
-|---|---|
-| `src/llama-memory-recurrent.h/.cpp` | Add `snapshot(seq_id) → snapshot_handle` and `restore(seq_id, snapshot_handle)`. Implemented as a device-to-device `ggml_backend_tensor_copy` of the sequence's `r_l`/`s_l` slot contents into a scratch buffer owned by the memory module. Small (Qwen3.5 ≈ 75 MB per snapshot). |
-| `src/llama-memory-hybrid.h/.cpp` | Wire snapshot/restore through: the hybrid memory snapshots the recurrent half and lets the attention half handle itself via existing partial `seq_rm`. |
-| `src/llama-memory.h` | Add virtual `snapshot`/`restore` (no-op defaults) and a `has_fast_partial_seq_rm()` flag. |
-| `common/common.cpp` | `common_context_can_seq_rm` returns `TYPE_PART` when `has_fast_partial_seq_rm()` is true for hybrid memory. |
-| `tools/server/server-context.cpp` | When `ctx_seq_rm_type == TYPE_PART`, skip the checkpoint path — use `llama_memory_seq_rm` directly. |
+---
 
-Verification:
-- `./build/bin/test_mtp_rollout` should still show ~66% t+2 agreement.
-- `llama-server --spec-type mtp --draft-max 1` should show **no checkpoint restore line** in the server log on rejects.
-- Expected speedup: move from current +10% (K=2) to roughly +15–25%, depending on reject frequency.
+## 3. What "slots" looks like concretely
 
-Risks:
-- Snapshot cost on device is non-trivial (~75 MB GPU→GPU copy ≈ 5–10 ms). If we snapshot before *every* spec verify, overhead compounds. Mitigation: snapshot **lazily** — only when the spec path is actually going to run (already gated by `slot.can_speculate()`).
-- The snapshot has to include the *conv* state, not just `r_l`/`s_l`. Qwen3.5 stores it in `ssm_conv1d` state; confirm the full state set (see `llama_memory_recurrent::state_write_data`).
+Today, for each recurrent layer:
 
-### Stage 2 — multi-slot per-token state during batched decode *(~2 weeks)*
+- `r_l[il]`: shape `[n_embd_r, mem_size]`, where `mem_size = n_seq_max`.
+- `s_l[il]`: shape `[n_embd_s, mem_size]`.
+- One cell per sequence; cell holds the latest state for that seq.
 
-**Goal:** match vLLM's cost model. Partial K>1 rejects become cheap. Eliminates checkpoint path entirely for hybrid models.
+After:
 
-This is where the kernel work lives. Breakdown:
+- `r_l[il]`: shape `[n_embd_r, mem_size * (1 + n_spec_max)]`, flat layout.
+- `s_l[il]`: shape `[n_embd_s, mem_size * (1 + n_spec_max)]`.
+- Per-cell **slot group** of `1 + n_spec_max` slots. Slot 0 is the active
+  committed state. Slots 1..n_spec_max hold per-token intermediates from the
+  most recent verify batch.
+- Lookup: state for seq `S` at slot `K` lives at flat row `K * mem_size + cells[S].tail`.
 
-#### 2a. Memory-module layout change
+Per-sequence active-slot selector (`active_slots[seq]`) controls which slot
+the next decode reads from. Defaults to 0 (committed). Set by the spec accept
+path on partial accept. **One-shot consume**: after a graph reads `active_slot`,
+it is reset to 0 — prevents downstream decodes from re-reading a stale slot
+when no rollback fires.
 
-Extend `llama_memory_recurrent` to hold `1 + n_draft_max` state slots per sequence, selectable by a per-sequence "active slot" index. Current per-layer tensors (`r_l[il]`, `s_l[il]`) are shape `[state_dim, n_seq_max, n_tokens_slot]`; the new axis is the slot.
+API (on `llama_memory_recurrent`):
 
-Public API (on `llama_memory_recurrent`):
 ```cpp
-void set_active_slot(llama_seq_id seq, int32_t slot);  // 0..n_draft_max
+void   set_active_slot(llama_seq_id seq, int32_t slot);  // 0..n_spec_max
 int32_t get_active_slot(llama_seq_id seq) const;
-void commit_slot(llama_seq_id seq, int32_t slot);  // promote slot → 0
 ```
 
-#### 2b. ggml op variants that emit per-token intermediate states
-
-The scan ops need a mode where, instead of returning `[y, final_state]`, they return `[y, state_0, state_1, ..., state_{T-1}]`. The CUDA kernels in `ggml/src/ggml-cuda/ssm-scan.cu` and `ssm-conv.cu` already compute these values per step; they just need an additional output buffer pointer and a write loop.
-
-Scope:
-- `ggml_ssm_scan` + backend kernels (CPU, CUDA, Metal, HIP as applicable) — the Mamba path.
-- Linear-attention ops for Qwen3-family models. `build_delta_net` in `llm_build_delta_net_base` uses standard ggml mul-mats + `ggml_ssm_scan` inside — so this mostly reduces to the scan op change.
-- `ggml_ssm_conv` (or equivalent) — the causal conv 1-D state.
-
-Each of these needs a new "emit intermediates" variant. The simpler path is to add a variant tensor (`s_intermediates` with shape `[state_dim, n_tokens, n_seq]`) alongside the existing state output. The original path (final-state-only) stays for non-spec users.
-
-#### 2c. Graph builder wiring
-
-For Qwen3.5 specifically (`src/models/qwen35.cpp::build_layer_attn_linear`):
-- Replace the single-state update with the "emit intermediates" op.
-- Route the per-token intermediate states to `recurrent_memory.slots[0..K]` via `ggml_cpy` (on-device, no host copy).
-
-#### 2d. Plumbing `num_accepted` from sampler → next graph
-
-A new per-sequence integer input to the graph: `num_accepted`. Before each decode, the sampler writes how many drafts from the previous step were accepted. The linear-attention / SSM graph reads its initial state from `slots[num_accepted - 1]` (or `slots[0]` if `num_accepted == 0`).
-
-This mirrors vLLM's `num_accepted_tokens_ptr` exactly.
-
-#### 2e. Speculative verify glue
-
-`common_speculative_state_mtp::accept(n_accepted)` currently a no-op. It should set the active slot index on the context so the next `llama_decode` picks up the right state.
-
-Same API surface as vLLM; just a small int that propagates into the graph input.
-
-Verification:
-- Acceptance metrics unchanged (they weren't wrong; the counter artifact is on the server side, not in our state).
-- Eliminate the checkpoint path entirely for hybrid memory in `server-context.cpp` — set `ctx_seq_rm_type = TYPE_PART` unconditionally for hybrid.
-- Expected speedup: approach the theoretical 1.67× that vLLM shows on pure-attention MTP, modulo Qwen3.5's SSM-layer batch inefficiency.
+Plumbed from `llama_context_params::n_spec_max` set by `common_context_params_to_llama`
+when `--spec-type` is given.
 
 ---
 
-## 5. Out of scope for this plan
+## 4. The kernel question (must be answered before phase 2)
 
-- **Kernel parallelism for SSM layers across batch positions.** Even with the rollback fix, Qwen3.5's per-token SSM cost still dominates; batch=2 is about 2× batch=1 wall-time on our hardware. That's a separate optimization (fused GDN kernels, etc.) and affects baseline, not just spec.
-- **D > 1 MTP.** All of this works for D=1 (the only deployed MTP model today). If a D>1 model ships, the chain mechanics in `common_speculative_state_mtp::draft` change slightly but the memory layer work above is unaffected.
-- **EAGLE3 support.** The existing EAGLE3 stub in `common/speculative.cpp:553` is orthogonal. Stage 1 & 2 benefit any spec type that runs on a hybrid-memory model, not just MTP.
+The whole plan hinges on this and was the failure point of the prior attempt.
+
+The verify batch decodes T = K+1 tokens. The recurrent kernel processes them
+as a sequence, internally producing T per-token states. We need to write each
+state into slot[t] AND have the resulting slot contents be **trajectory-
+compatible** with what the kernel used for normal T=1 decode would produce.
+
+Three options, in order of decreasing risk:
+
+### Option A — chunking emit, with master also forced to chunking
+
+Add the "emit intermediates" output to the chunking GDN op (the prior attempt
+already did this). Forces master's normal T=1 generation through the chunking
+kernel as well, so trajectories match.
+
+- **Pre-flight gate:** master with `FUSED_GDN_AR=0` (forces trajectory A
+  everywhere) must produce coherent output at n_predict=500 on the spiral
+  prompts. Per `findings.md`, this was tested and *did* work on the prior
+  attempt. Re-verify before committing to this option.
+- **Risk:** moves master's hot path from Fused-AR → chunking. May cost
+  per-token throughput on T=1 decode that we don't recover from spec wins.
+  Needs a benchmark before/after.
+
+### Option B — serialized AR inside the verify batch
+
+In the verify batch's recurrent-layer subgraph, instead of one chunking call
+over T tokens, issue T serialized AR-kernel calls. Each writes its post-state
+into slot[t]. Attention layers still batch across T (the win comes from there
+on hybrid models anyway).
+
+- Same kernel for verify and for normal T=1 generation → same trajectory by
+  construction.
+- **Risk:** per-T-token serialization eats some of the verify-batch win that
+  this plan exists to capture. May still net positive because the alternative
+  is "no spec at all" or "snapshot+reverify."
+- Implementation surface is higher than option A — must rewrite
+  `build_layer_attn_linear` for qwen3.5 to issue the serialized ops and
+  thread per-step output into slots.
+
+### Option C — root-cause the AR vs chunking 19.65 divergence
+
+The two kernels should produce numerically equivalent outputs (modulo FP
+noise). They don't. One of them is wrong, or there's a mathematical
+difference in how chunking handles boundary conditions vs AR.
+
+- If chunking is correct, fix Fused-AR — and option A becomes free.
+- If AR is correct, fix chunking emit — and the original "emit-from-chunking"
+  approach works without forcing master onto trajectory A.
+- **Risk:** unbounded debugging exercise. Could be quick or could be weeks.
+  Worth a focused 2-3 day timebox before committing to A or B.
+
+**Recommended sequence:** spend up to 3 days on option C. If unresolved,
+switch to option B (the safest correctness story). Keep option A as a fallback
+if option B's serialization cost is unacceptable.
 
 ---
 
-## 6. Recommended implementation order
+## 5. Phased plan
 
-1. Stage 1 end-to-end first, even if modest speedup — it **proves the plumbing** (memory-module snapshot APIs, the `has_fast_partial_seq_rm` flag, server side-path). Stage 2 reuses all of it.
-2. Within Stage 2, start with `ggml_ssm_scan` + CPU backend (easy to debug), then CUDA, then the other backends that actually matter (Metal, HIP).
-3. Linear-attention path for Qwen3.5 is its own bundle — do the pure-Mamba kernel first, then port the pattern.
-4. Only remove the server checkpoint path after Stage 2 is validated; it stays as a fallback path for any model that doesn't opt into multi-slot memory.
+### Phase 0 — gates (no code, just regression tests in place)
+
+- `scripts/test_spiral_regression.py` — already exists. Long-prompt
+  baseline-vs-spec coherence test with attractor detection.
+- `scripts/test_gdn_emit.cpp` — already exists from prior attempt
+  (untracked). Per-slot bit-identity check at Qwen3.6 sizes.
+- **NEW:** `test_gdn_trajectory.cpp` — directly compare AR-kernel vs
+  chunking-kernel trajectories on the same input over N tokens. Asserts
+  max-abs-diff < tol on intermediate states. Currently fails by 19.65;
+  any phase-2 design must turn this green before merging.
+- **NEW:** `test_prefill_state.cpp` (was started in prior attempt;
+  untracked) — byte-compare recurrent state after N prefill tokens between
+  `n_spec_max=0` and `n_spec_max>0`. Must be byte-identical. This catches
+  the prior attempt's `n_parallel>1` corruption.
+
+Phase 0 gate: spiral and prefill-state tests green on master (they should
+be, since master doesn't widen). Trajectory test failing is the open
+problem to solve before phase 2.
+
+### Phase 1 — memory layer slot widening (no kernel changes yet)
+
+- `src/llama-memory-recurrent.{h,cpp}`:
+  - Constructor takes `n_spec_max` (additional axis size).
+  - Allocate `r_l[il]`, `s_l[il]` with extra rows for slot 1..n_spec_max.
+  - Add `active_slots[seq]` vector, `set_active_slot` / `get_active_slot`.
+  - Modify `llama_memory_recurrent_context::s_copy(i)` to add the active
+    slot's row offset, with one-shot consume reset to 0.
+  - Partial `seq_rm` (mid-sequence truncation) now succeeds when n_spec_max > 0.
+- `src/llama-memory-hybrid.{h,cpp}`: thread `n_spec_max` through to mem_recr;
+  expose `set_active_slot`.
+- `src/llama-context.{h,cpp}` + `include/llama.h`: add
+  `llama_context_params::n_spec_max`, `llama_memory_set_active_slot` C API.
+- `common/common.cpp` (`common_context_params_to_llama`): set `n_spec_max`
+  from `params.speculative.n_max` when `--spec-type` is given.
+- `src/llama-graph.cpp::build_rs`: reshape over the widened rows; guard the
+  copy path for the empty range.
+
+**Gates before merging phase 1:**
+- `test_prefill_state` byte-identical for `n_spec_max=0` vs `n_spec_max=2`,
+  under both `-np 1` and `-np 4`.
+- Spiral regression PASS with `n_spec_max=2` and `--spec-type` not set
+  (i.e., widened tensor, no spec, no emit, no slot reads). Output must be
+  bit-identical to non-widened.
+- No throughput regression on plain T=1 generation (within FP noise).
+
+Phase 1 is purely structural. If gates fail here, the rest of the plan is
+moot until find_slot/build_rs are debugged.
+
+### Phase 2 — kernel emit (per Section 4 decision)
+
+Implement the chosen kernel direction (A, B, or C-driven). For each:
+
+- New ggml op or modification: `ggml_gated_delta_net` gains an emit-mode
+  output tensor `s_intermediates` of shape `[state_dim, n_tokens]` per call.
+  The tensor lives in graph scratch and is `ggml_cpy`'d into `r_l`/`s_l`
+  slot rows by the model graph builder.
+- Backend kernels: CUDA + CPU at minimum. Metal/HIP tracking issue.
+- `src/models/qwen35.cpp::build_layer_attn_linear`: when emit is needed
+  (n_spec_max > 0, T > 1, T <= 1+n_spec_max), use the emit op and route
+  per-token output states into `recurrent.r_l`/`s_l` slots 1..T-1.
+
+**Gates before merging phase 2:**
+- `test_gdn_emit` per-slot bit-identity PASS.
+- `test_gdn_trajectory` PASS (this is the gate the prior attempt didn't
+  have and didn't notice was failing).
+- Spiral regression PASS with `--spec-type mtp` and the slot reads triggered
+  via partial-accept simulation (write a probe that forces active_slot != 0).
+- Spiral regression PASS at n_predict=500 AND n_predict=1000 — the prior
+  attempt was coherent at 400 but spiraled at 500. Must clear both.
+
+### Phase 3 — server / spec verify integration
+
+- `common/speculative.cpp::common_speculative_state_mtp::accept(M)`:
+  set `active_slot = M+1` on the seq, trim `mtp_n_hidden` to `M+1`.
+- `tools/server/server-context.cpp`: on partial accept, just call
+  `llama_memory_set_active_slot(mem, slot.id, M+1)` — no ckpt save, no
+  ckpt restore, no reverify, no snapshot. The next decode reads slot[M+1]
+  and proceeds as if from a freshly-committed state.
+- Counter fix carried forward: update `n_draft_accepted`/`n_draft_total`
+  on every iteration including partial-accept. Uncovers true reject rate.
+
+**Gates before merging phase 3:**
+- Spiral regression PASS at K=1, K=2, K=3 on Roman 600.
+- Acceptance counter honest (matches per-iteration debug trace).
+- Throughput at K=2 ≥ 1.5× baseline (Stage 2 target from earlier plan
+  iteration; confirms we recouped the work).
+- Spec verify uses *no* ckpt path for hybrid. Server log has zero "restoring
+  speculative checkpoint" lines on rejects.
+
+### Phase 4 — MTP-specific work (deferred)
+
+Once phases 1-3 prove the slot infrastructure on hybrid memory generally
+(ideally validated with a separate small draft model so reject rate is
+not artificially zero), then re-engage MTP:
+
+- Verify the chained-MTP draft gen (`common_speculative_state_mtp::draft`)
+  doesn't introduce its own state pollution into the slot system.
+- Investigate whether `mtp_h_cache` needs parallel slot widening.
+- Consider: at 100% acceptance (which MTP greedy currently hits — see
+  session notes), the slot path doesn't fire much. Its value is for
+  divergent draft setups (smaller models, temp>0 with proper rejection
+  sampling). MTP may benefit only marginally.
 
 ---
 
-## 7. How to validate at each stage
+## 6. Out of scope
 
-**Correctness probe:** keep `scripts/test_mtp_rollout.cpp`. t+2 rate is architecture-correct regardless of rollback mechanism; if it drops, you broke the state handling.
-
-**Throughput probe:**
-```
-./build/bin/llama-server -m ../qwen3.6-bf16-mtp.gguf -c 4096 \
-    --spec-type mtp --draft-max 2 --draft-p-min 0 --no-warmup
-curl -s http://127.0.0.1:8080/completion -d '{"prompt":"Once upon a time in a distant galaxy,","n_predict":200,"temperature":0,"cache_prompt":false}' | jq .timings
-```
-Baseline for this branch today: 5.26 tok/s at K=2. Stage 1 target: 5.6+ tok/s. Stage 2 target: 7+ tok/s (approaches 1.6× baseline).
-
-**Spec-verify tracing:** the `SPEC_VERIFY_DEBUG=1` probe I added and reverted (`common/sampling.cpp::common_sampler_sample_and_accept_n`) can be re-added as a temporary tool. Real-accept vs loopback-accept is the signal.
+- **Snapshot/restore on the existing single-slot tensor.** Was prototyped this
+  session, ~9-15% throughput win at 100% MTP accept (where restore never
+  fires). Not worth maintaining as a parallel path once slots land.
+- **`spec_ckpt`-side reverify-elimination.** Was prototyped this session —
+  saves one re-decode per reject but needs careful prompt-token /
+  sampler / streaming bookkeeping that duplicates the full-accept path.
+  Slots make it obsolete.
+- **Mamba SSM-scan support.** `ggml_ssm_scan` would need the same emit-
+  intermediates treatment. Tracking issue, not blocking GDN.
+- **EAGLE3 or D>1 MTP.** Orthogonal to the memory layer.
+- **Counter honesty fix in `sampling.cpp`-adjacent code.** Worth landing
+  independently as a small PR; the trivial-reverify-only counter masks
+  every spec setup's real reject rate, not just hybrid.
 
 ---
 
-## 8. Files that will be touched, for a handoff check-in
+## 7. Files that will be touched (estimate)
 
-Stage 1:
+Phase 0: ~250 LOC of test code (mostly salvaging existing untracked tests).
+
+Phase 1: ~300 LOC.
 - `src/llama-memory.h`
-- `src/llama-memory-recurrent.h/.cpp`
-- `src/llama-memory-hybrid.h/.cpp`
-- `common/common.cpp` (`common_context_can_seq_rm`)
-- `tools/server/server-context.cpp` (skip checkpoint when TYPE_PART)
+- `src/llama-memory-recurrent.{h,cpp}`
+- `src/llama-memory-hybrid.{h,cpp}`
+- `src/llama-context.{h,cpp}`
+- `src/llama-graph.cpp::build_rs`
+- `include/llama.h` (`llama_memory_set_active_slot`)
+- `common/common.cpp`
 
-Stage 2:
-- Everything above, plus:
-- `ggml/src/ggml.c` (new `ggml_ssm_scan_emit_states` op)
-- `ggml/src/ggml-cuda/ssm-scan.cu` (+ `ssm-conv.cu`)
-- `ggml/src/ggml-cpu/ops/ssm-scan.cpp` (backend CPU fallback)
-- `src/models/qwen35.cpp::build_layer_attn_linear` (use emit-states op + slot routing)
-- `src/llama-graph.h/.cpp` (plumb `num_accepted` input)
-- `common/speculative.cpp::common_speculative_state_mtp::accept` (set active slot)
+Phase 2: ~600 LOC (most of this is the GDN kernel emit path on CUDA + CPU,
+plus wiring in qwen35.cpp).
+- `ggml/include/ggml.h`, `ggml/src/ggml.c` (op declaration)
+- `ggml/src/ggml-cuda/gated_delta_net.cu` (EMIT template)
+- `ggml/src/ggml-cpu/ops.cpp` (CPU reference)
+- `src/models/qwen35.cpp::build_layer_attn_linear`
+- `src/models/delta-net-base.cpp`
 
-Total LOC estimate:
-- Stage 1: ~400
-- Stage 2: ~1500 including backend variants (CPU/CUDA at minimum)
+Phase 3: ~100 LOC.
+- `common/speculative.cpp::common_speculative_state_mtp::accept`
+- `tools/server/server-context.cpp` (replace ckpt branch with slot select)
+
+Phase 4: TBD.
 
 ---
 
-## 9. Starting point when picking this up
+## 8. Where to start
 
-The current branch at `2a070609a` has:
-- K=1 and K-chained MTP working end-to-end via `llama_mtp_decode`.
-- Server integration via `common_speculative_state_mtp` and `--spec-type mtp`.
-- K=2 demonstrates +10% end-to-end speedup on Qwen3.6, limited by exactly the rollback problem this plan addresses.
-- `scripts/test_mtp_rollout.cpp` for regression testing the draft semantics.
+1. Salvage `scripts/test_gdn_emit.cpp`, `scripts/test_prefill_state.cpp`,
+   `scripts/test_slot_recovery.cpp`, `scripts/test_layer_diff.cpp`,
+   `scripts/test_rollback_repro.cpp` from the working tree (untracked from
+   the prior attempt). These are the diagnostic kit. Decide which to keep,
+   port to `tests/` proper, register in CMakeLists.
+2. Write `test_gdn_trajectory` (Section 5 phase 0). Run against master.
+   Confirm it fails at ~19.65 on Qwen3.6.
+3. Spend the timebox on option C from Section 4. If unresolved, lock in
+   option B and proceed to Phase 1.
+4. Phase 1 in isolation, with its three gates green, before any kernel work.
 
-Read `common/speculative.cpp::common_speculative_state_mtp` and `src/models/qwen35.cpp::build_standalone_mtp` for the current flow. Then pick up Stage 1 with `src/llama-memory-recurrent.{h,cpp}` — the `snapshot` / `restore` methods are the smallest committable unit.
+The earlier session's working tree has untracked files that started this
+investigation. Do not delete them blindly — they encode debugging state
+that took real effort to produce.

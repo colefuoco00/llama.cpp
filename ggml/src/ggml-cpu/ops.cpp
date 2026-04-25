@@ -10467,16 +10467,27 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const bool kda = (neg0 == S_v);
 
-    // scratch layout per thread: [delta(S_v)]
-    const int64_t scratch_per_thread = S_v;
+    // emit-intermediates mode: write per-token state snapshots after each
+    // GDN step instead of just the final state. Used for spec-decode
+    // partial-rollback.
+    const bool emit = (((const int32_t *) dst->op_params)[0] != 0);
+
+    // scratch layout per thread: [delta(S_v) | state_buf(S_v*S_v) if emit]
+    // (in non-emit mode the state mutation happens directly on dst memory;
+    // in emit mode the dst's "state" region holds T snapshots so we can't
+    // use it as an in-place work buffer for the running scan.)
+    const int64_t per_thread = S_v + (emit ? S_v * S_v : 0);
     const int ith = params->ith;
 
-    float * delta = (float *)params->wdata + ith * scratch_per_thread + CACHE_LINE_SIZE_F32;
+    float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
+    float * state_work  = emit ? (delta + S_v) : nullptr;
 
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs floats
-    // new_states:  S_v * S_v * H * n_seqs floats
-    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+    // new_states:  S_v * S_v * H * n_seqs    floats           (non-emit)
+    //              S_v * S_v * H * n_seqs * T floats (T snaps, emit)
+    const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
+    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float * attn_out_base  = (float *)dst->data;
     float * state_out_base = (float *)dst->data + attn_score_elems;
 
@@ -10499,9 +10510,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        float * s_out = state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        // In non-emit mode the state mutation happens directly on the output
+        // buffer (final-state slot for this head/seq). In emit mode we work
+        // on a per-thread scratch buffer and memcpy a copy out to the
+        // appropriate snapshot slot after each token.
+        float * s_out = emit
+            ? state_work
+            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
-        // copy input state into output buffer and operate in-place
+        // copy input state into the working buffer and operate in-place
         const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
@@ -10552,6 +10569,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             }
 
             attn_data += S_v * H; // advance to next token
+
+            // emit: snapshot the post-token-t state into slot t. Slot T-1
+            // holds the final state (matches non-emit semantics for callers
+            // that only need the final). Slots 0..T-2 hold intermediates.
+            if (emit) {
+                float * snap_t = state_out_base + t * state_size_per_snap +
+                                 (iv3 * H + iv1) * S_v * S_v;
+                memcpy(snap_t, s_out, S_v * S_v * sizeof(float));
+            }
         }
     }
 }

@@ -2933,7 +2933,13 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_GATED_DELTA_NET:
                     {
                         const int64_t S_v = node->src[2]->ne[0];
-                        cur = S_v * sizeof(float) * n_tasks;
+                        // emit-mode kernel needs an extra S_v*S_v floats per
+                        // thread to hold the working state (since the in-
+                        // place mutation can no longer happen on the output
+                        // buffer when we keep T per-token snapshots).
+                        const bool emit = (((const int32_t *) node->op_params)[0] != 0);
+                        const int64_t per_thread = S_v + (emit ? S_v * S_v : 0);
+                        cur = per_thread * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_COUNT:
                     {

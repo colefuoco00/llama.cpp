@@ -92,6 +92,12 @@ struct server_slot {
     server_prompt_checkpoint spec_ckpt;
     common_speculative_ptr spec;
 
+    // Slot-rollback path (HYBRID_PARTIAL_SEQRM_PLAN). When the recurrent
+    // memory was sized with (1 + n_spec_max) slots, partial seq_rm rolls
+    // back via a slot index lookup — no host checkpoint needed. Only the
+    // pre-verify prompt length is recorded so we know where to trim.
+    int64_t spec_snap_n_tokens = 0;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -209,6 +215,7 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_snap_n_tokens = 0;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -343,9 +350,10 @@ struct server_slot {
             const auto & params_spec = task->params.speculative;
 
             if (!spec_draft.empty()) {
-                // we have a previous (partial) draft to reuse
+                // we have a previous (partial) draft to reuse — either a host
+                // ckpt or a slot-path snap_n_tokens must have been recorded.
                 if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-                    GGML_ASSERT(!spec_ckpt.empty());
+                    GGML_ASSERT(!spec_ckpt.empty() || spec_snap_n_tokens > 0);
                 }
             } else {
                 GGML_ASSERT(spec_i_batch.empty());
@@ -363,13 +371,23 @@ struct server_slot {
                     spec_draft.clear();
                 }
 
-                if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                if (!spec_draft.empty()) {
                     const auto n_tokens = prompt.tokens.size();
 
-                    spec_ckpt = server_get_checkpoint(ctx, this->id, n_tokens);
-
-                    SLT_DBG(*this, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
-                            spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
+                    if (llama_n_spec_max(ctx) > 0) {
+                        // Slot path: recurrent memory holds per-token state
+                        // snapshots in slots, so no host-memory ckpt is
+                        // needed. Just record the pre-verify prompt length;
+                        // the partial-accept branch uses it to compute the
+                        // seq_rm cutoff.
+                        spec_snap_n_tokens = (int64_t) n_tokens;
+                        SLT_DBG(*this, "spec slot path: snap_n_tokens=%zu (n_spec_max=%u)\n",
+                                n_tokens, (unsigned) llama_n_spec_max(ctx));
+                    } else if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                        spec_ckpt = server_get_checkpoint(ctx, this->id, n_tokens);
+                        SLT_DBG(*this, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
+                                spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
+                    }
                 }
             }
 
@@ -2964,11 +2982,17 @@ private:
 
                 // verify and try to accept the draft
                 {
-                    const bool use_ckpt = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                    // Three rollback paths on partial accept:
+                    //   - SLOT: recurrent memory has per-token state slots; partial seq_rm
+                    //           does the rollback via slot select. No host-state save needed.
+                    //   - CKPT: host-memory checkpoint (pre-slots fallback for hybrid).
+                    //   - PART: pure-attention auto-rollback via positional overwrite.
+                    const bool use_slot = (llama_n_spec_max(slot.ctx) > 0) && (slot.spec_snap_n_tokens > 0);
+                    const bool use_ckpt = !use_slot && (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+                    const bool will_rollback = use_slot || use_ckpt;
 
-                    // only save the sampler sampler state if we use checkpoints
                     common_sampler_ptr smpl_save;
-                    if (use_ckpt) {
+                    if (will_rollback) {
                         smpl_save.reset(common_sampler_clone(slot.smpl.get()));
                     }
 
@@ -2982,6 +3006,74 @@ private:
 
                     // check for partial draft acceptance
                     if (accepted.size() < slot.spec_draft.size() + 1) {
+                        if (use_slot) {
+                            // Slot-rollback (simplified): seq_rm pulls recurrent
+                            // state back to "kept sampled + M accepted drafts"
+                            // by routing to slot K-M. R becomes the new seed,
+                            // re-decoded by iter N+1 like a full-accept path.
+                            // No redecode here, no extra next_seed sampling.
+                            //
+                            // Final state mirrors full-accept exactly:
+                            //   cell.pos  = L+M
+                            //   prompt    = [..., S0, d1..dM]   (length L+1+M)
+                            //   sampled   = R                    (placed by iter N+1)
+                            slot.spec_draft = std::move(accepted);  // [d1..dM, R]
+                            const size_t M = slot.spec_draft.size() - 1;  // accepted drafts
+                            const llama_pos p0 = (llama_pos)(slot.spec_snap_n_tokens + 1 + M);  // = L+M+1
+
+                            auto * mem = llama_get_memory(slot.ctx);
+                            if (!llama_memory_seq_rm(mem, slot.id, p0, -1)) {
+                                GGML_ABORT("%s: slot-path seq_rm partial failed (snap_n_tokens=%lld, M=%zu, p0=%d)\n",
+                                        __func__, (long long) slot.spec_snap_n_tokens, M, (int) p0);
+                            }
+                            SLT_DBG(slot, "spec slot rollback: snap_n_tokens=%lld M=%zu p0=%d\n",
+                                    (long long) slot.spec_snap_n_tokens, M, (int) p0);
+
+                            // Bookkeeping mirror of full-accept:
+                            //   keep_first(L+1) = prompt + S0
+                            //   insert [d1..dM]  → length L+1+M
+                            //   sampled = R  (NOT in prompt.tokens; iter N+1 places it)
+                            slot.prompt.tokens.keep_first((size_t) slot.spec_snap_n_tokens + 1);
+                            if (M > 0) {
+                                slot.prompt.tokens.insert({slot.spec_draft.begin(), slot.spec_draft.begin() + M});
+                            }
+
+                            // Mirror full-accept's seq_rm trim past prompt length so attention KV doesn't carry stale cells.
+                            llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
+
+                            common_speculative_accept(slot.spec.get(), M);
+
+                            const int64_t t_current = ggml_time_us();
+                            slot.n_decoded         += slot.spec_draft.size();
+                            slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+                            slot.n_draft_accepted  += M;
+                            slot.n_draft_total     += n_draft;
+
+                            // Stream the kept tokens (accepted drafts + resampled).
+                            // process_token sets slot.sampled = result.tok each call;
+                            // last is R, so slot.sampled ends as R (same as full-accept).
+                            bool released = false;
+                            for (size_t i = 0; i < slot.spec_draft.size(); ++i) {
+                                completion_token_output result;
+                                result.tok          = slot.spec_draft[i];
+                                result.text_to_send = common_token_to_piece(slot.ctx, result.tok, accept_special_token(slot, result.tok));
+                                result.prob         = 1.0f;
+                                if (!process_token(result, slot)) {
+                                    slot.print_timings();
+                                    send_final_response(slot);
+                                    metrics.on_prediction(slot);
+                                    slot.release();
+                                    released = true;
+                                    break;
+                                }
+                            }
+
+                            slot.spec_draft.clear();
+                            slot.spec_i_batch.clear();
+
+                            if (released) { continue; }
+                            continue;
+                        }
                         if (use_ckpt) {
                             // partial acceptance is not supported by the context -> truncate the draft and restore the state
                             slot.spec_draft = std::move(accepted);
@@ -3001,6 +3093,9 @@ private:
 
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);
                             slot.smpl = std::move(smpl_save);
+
+                            slot.n_draft_accepted += slot.spec_draft.size() - 1;
+                            slot.n_draft_total   += n_draft;
 
                             continue;
                         }

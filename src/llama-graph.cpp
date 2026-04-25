@@ -2526,7 +2526,14 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   rs_zero,
         const llm_graph_get_rows_fn & get_state_rows) const {
 
-    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, rs_size);
+    // Reshape over the tensor's actual axis-1 size, not just rs_size: when the
+    // recurrent memory is widened with speculative-rollback slots (n_spec > 0)
+    // s->ne[1] = rs_size * (1 + n_spec); reshaping to [state_size, rs_size]
+    // would drop slot rows and trigger an element-count mismatch. Slot 0
+    // occupies rows [0, rs_size) so all existing get_rows / view operations
+    // below continue to address the active state correctly.
+    GGML_UNUSED(rs_size);
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.

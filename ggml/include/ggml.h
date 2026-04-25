@@ -2539,6 +2539,26 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
+    // Emit-intermediates variant: returns the same attention scores as
+    // ggml_gated_delta_net but, instead of a single final state, returns T
+    // per-token state snapshots packed into the output tensor. The output
+    // layout is:
+    //   [attn_scores: S_v * H * T * n_seqs]
+    //   [state_snap[0]: S_v * S_v * H * n_seqs]   (state after token 0)
+    //   [state_snap[1]: S_v * S_v * H * n_seqs]
+    //   ...
+    //   [state_snap[T-1]: S_v * S_v * H * n_seqs] (state after token T-1, == final)
+    // Used by speculative-rollback paths to recover state-after-k-tokens for
+    // a partial-accept rollback. op_params[0] is set to 1 to flag the kernel.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_emit(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);

@@ -1490,6 +1490,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
+    // Recurrent slot capacity for spec-decode partial-rollback. Sized to
+    // params.speculative.n_max when --spec-type is given so the verify batch
+    // (1 + n_max tokens) fits in (1 + n_spec_max) slots.
+    cparams.n_spec_max        = (params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE)
+                                ? (uint32_t) params.speculative.n_max : 0u;
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;
