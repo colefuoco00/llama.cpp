@@ -123,10 +123,10 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     llama_model_params mparams = llama_model_default_params();
-    // Phase 2 emit kernel is CPU-only this iteration; force CPU offload so
-    // the GDN op picks up the emit flag in op_params instead of falling
-    // through to a CUDA path that ignores it.
-    mparams.n_gpu_layers = 0;
+    // n_gpu_layers controlled via NGL env (default 0 = CPU). Set NGL=99 to
+    // exercise the CUDA emit kernel and slot-aware s_copy on GPU.
+    const char * ngl_env = std::getenv("NGL");
+    mparams.n_gpu_layers = ngl_env ? atoi(ngl_env) : 0;
     llama_model * model = llama_model_load_from_file(model_path, mparams);
     if (!model) { fprintf(stderr, "load failed\n"); return 2; }
 
