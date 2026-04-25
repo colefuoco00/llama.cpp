@@ -1,4 +1,4 @@
-// Phase 1 (memory slot widening) byte-identity gate.
+// Slot widening byte-identity gate.
 //
 // Verifies that adding (1+n_spec_max) state slots to the recurrent memory
 // tensors does NOT perturb the prefill state when no slot reads/writes are
@@ -8,9 +8,6 @@
 // Direct memory comparison isn't possible without leaking internals, so we
 // compare end-to-end: post-prefill+decode logits must be bit-identical
 // (within tight FP) between n_spec_max=0 and n_spec_max=3.
-//
-// On master this would not compile (no n_spec_max field) — runs only after
-// llama_context_params::n_spec_max is added (Phase 1).
 //
 // Usage:
 //   ./build/bin/test-recurrent-prefill-state <model.gguf>

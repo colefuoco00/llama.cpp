@@ -171,9 +171,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // partial intersection that includes the final pos: try slot
             // select if a per-token snapshot is available within rollback
             // distance. Recurrent kernels write state-after-(T-s) tokens to
-            // slot `s` during a multi-token decode (HYBRID_PARTIAL_SEQRM_PLAN);
-            // here we just look up which slot corresponds to the requested
-            // truncation and arm `active_slots[seq]` for the next graph build.
+            // slot `s` during a multi-token decode; here we just look up
+            // which slot corresponds to the requested truncation and arm
+            // `active_slots[seq]` for the next graph build.
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 if (rollback >= 1 && rollback <= (llama_pos) n_spec) {
@@ -1196,12 +1196,12 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         return src0;
     }
 
-    // Slot widening (HYBRID_PARTIAL_SEQRM_PLAN phase 1). active_slots[seq]
-    // holds the rollback slot index set by seq_rm's partial path; when
-    // non-zero, the graph reads from row (slot * mem_size + cell_idx) so the
-    // next decode resumes from the per-token snapshot rather than the
-    // committed state. One-shot consume: clear after read so subsequent
-    // graph builds see slot 0 unless another seq_rm partial fires.
+    // active_slots[seq] holds the rollback slot index set by seq_rm's
+    // partial path; when non-zero, the graph reads from row
+    // (slot * mem_size + cell_idx) so the next decode resumes from the
+    // per-token snapshot rather than the committed state. One-shot
+    // consume: cleared after read so subsequent graph builds see slot 0
+    // unless another seq_rm partial fires.
     uint32_t slot = 0;
     if (!mem->cells[cell_idx].seq_id.empty()) {
         const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
