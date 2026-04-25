@@ -92,10 +92,10 @@ struct server_slot {
     server_prompt_checkpoint spec_ckpt;
     common_speculative_ptr spec;
 
-    // Slot-rollback path (HYBRID_PARTIAL_SEQRM_PLAN). When the recurrent
-    // memory was sized with (1 + n_spec_max) slots, partial seq_rm rolls
-    // back via a slot index lookup — no host checkpoint needed. Only the
-    // pre-verify prompt length is recorded so we know where to trim.
+    // Slot-rollback path: when the recurrent memory was sized with
+    // (1 + n_spec_max) slots, partial seq_rm rolls back via a slot
+    // index lookup — no host checkpoint needed. Only the pre-verify
+    // prompt length is recorded so we know where to trim.
     int64_t spec_snap_n_tokens = 0;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state

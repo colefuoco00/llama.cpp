@@ -242,10 +242,10 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
     // Emit per-token state snapshots into recurrent slots when the verify
-    // batch fits in the configured slot capacity (HYBRID_PARTIAL_SEQRM_PLAN).
-    // Slot 0 holds the final (post-T-tokens) state — matches existing
-    // semantics. Slots 1..T-1 hold per-token intermediates so a partial
-    // seq_rm can roll back via slot select instead of restoring or reverify.
+    // batch fits in the configured slot capacity. Slot 0 holds the final
+    // (post-T-tokens) state — matches existing semantics. Slots 1..T-1
+    // hold per-token intermediates so a partial seq_rm can roll back via
+    // slot select instead of restoring or reverify.
     const uint32_t mem_size  = mctx_cur->get_size();
     const bool emit_states   = (cparams.n_spec_max > 0)
                             && (n_seq_tokens > 1)

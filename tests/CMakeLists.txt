@@ -213,17 +213,16 @@ llama_build_and_test(
 )
 llama_build_and_test(test-regex-partial.cpp)
 
-# Recurrent partial-rollback gate (HYBRID_PARTIAL_SEQRM_PLAN). Built only;
-# user invokes as `./bin/test-recurrent-rollback <hybrid-model.gguf>`. Fails on
-# master at seq_rm (recurrent rejects partial truncation); becomes the
-# correctness gate as the slot/emit work lands.
+# Recurrent partial-rollback gate. Built only; user invokes as
+# `./bin/test-recurrent-rollback <hybrid-model.gguf>`. Compares the
+# rolled-back slot state against a sequential-decode reference.
 llama_build(test-recurrent-rollback.cpp)
 
-# Phase 1 byte-identity gate: with n_spec_max>0 (slots widened) but no slot
-# reads/writes, output must match n_spec_max=0.
+# Slot-widening byte-identity: with n_spec_max>0 (slots widened) but no
+# slot reads/writes, output must match n_spec_max=0.
 llama_build(test-recurrent-prefill-state.cpp)
 
-# Phase 2 GDN-emit kernel correctness: emit[T-1] must equal non-emit final.
+# GDN-emit kernel correctness: emit[T-1] must equal non-emit final state.
 llama_build_and_test(test-gdn-emit.cpp)
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
