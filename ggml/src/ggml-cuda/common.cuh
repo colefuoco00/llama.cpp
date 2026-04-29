@@ -1225,7 +1225,9 @@ struct ggml_cuda_concurrent_event {
     ggml_cuda_concurrent_event(const ggml_cuda_concurrent_event &) = delete;
     ggml_cuda_concurrent_event & operator=(const ggml_cuda_concurrent_event &) = delete;
 
-    explicit ggml_cuda_concurrent_event(int n_streams) : n_streams(n_streams) {
+    bool valid;
+
+    explicit ggml_cuda_concurrent_event(int n_streams) : n_streams(n_streams), valid(true) {
         join_events.resize(n_streams);
 
         for (size_t i = 0; i < join_events.size(); ++i) {
@@ -1240,7 +1242,8 @@ struct ggml_cuda_concurrent_event {
     , fork_event(other.fork_event)
     , n_streams(other.n_streams)
     , stream_mapping(std::move(other.stream_mapping))
-    , join_node(other.join_node) {
+    , join_node(other.join_node)
+    , valid(other.valid) {
         other.fork_event = nullptr;
     }
 

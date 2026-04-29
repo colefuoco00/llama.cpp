@@ -4051,6 +4051,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
             concurrent_event = &stream_ctx.concurrent_events[node];
 
+            if (!concurrent_event->valid) {
+                return;
+            }
+
             is_concurrent_event_active = true;
 
             GGML_LOG_DEBUG("Launching %d streams at %s\n", concurrent_event->n_streams, node->name);
@@ -4072,15 +4076,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
-            // Drop only the events that fail validity (overlapping writes or cross-stream
-            // src dependencies). The remaining events still drive concurrency for their windows.
-            for (auto it = stream_ctx.concurrent_events.begin(); it != stream_ctx.concurrent_events.end(); ) {
-                if (!it->second.is_valid()) {
+            // Mark events that fail validity (overlapping writes or cross-stream src
+            // dependencies) as invalid; try_launch_concurrent_event skips them at runtime.
+            // The remaining events still drive concurrency for their windows.
+            for (auto & [tensor, event] : stream_ctx.concurrent_events) {
+                if (!event.is_valid()) {
+                    event.valid = false;
                     GGML_LOG_DEBUG("dropping invalid concurrent_event at %s\n",
-                                   it->first ? it->first->name : "(null)");
-                    it = stream_ctx.concurrent_events.erase(it);
-                } else {
-                    ++it;
+                                   tensor ? tensor->name : "(null)");
                 }
             }
 
@@ -4101,9 +4104,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         is_concurrent_event_active = false;
                         concurrent_event           = nullptr;
                     } else {
-                        GGML_ASSERT (concurrent_event->stream_mapping.find(node) != concurrent_event->stream_mapping.end());
-                        cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
-                        GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
+                        // The node may not be in stream_mapping when it's a noop "bridge" between
+                        // the fork key and the first real window node (we walk fork_key backward
+                        // past noop tails of the preceding window). Noops hit the continue below
+                        // anyway, so it's safe to leave curr_stream_no on whatever it was.
+                        auto it = concurrent_event->stream_mapping.find(node);
+                        if (it != concurrent_event->stream_mapping.end()) {
+                            cuda_ctx->curr_stream_no = it->second;
+                            GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
+                        }
                     }
                 } else if (i - prev_i > 1) {
                     //the previous node was fused
@@ -4111,8 +4120,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(prev_node);
 
                     if (is_concurrent_event_active) {
-                        cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
-                        GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
+                        auto it = concurrent_event->stream_mapping.find(node);
+                        if (it != concurrent_event->stream_mapping.end()) {
+                            cuda_ctx->curr_stream_no = it->second;
+                            GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
+                        }
                     }
                 }
 
@@ -4531,20 +4543,39 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     auto & concurrent_events = cuda_ctx->stream_context().concurrent_events;
     constexpr int max_forked_streams = GGML_CUDA_MAX_STREAMS - 1; // stream 0 is the main stream
 
+    // The fork key must be a real compute node — the eval loop in graph_compute does
+    //   if (ggml_is_empty(node) || op == RESHAPE/TRANSPOSE/VIEW/PERMUTE/NONE) continue;
+    // *before* try_launch_concurrent_event runs, so a noop fork key would never fire its fork.
+    const auto & is_noop_op = [](const ggml_tensor * t) {
+        return ggml_is_empty(t) ||
+               t->op == GGML_OP_NONE   || t->op == GGML_OP_RESHAPE   ||
+               t->op == GGML_OP_VIEW   || t->op == GGML_OP_TRANSPOSE ||
+               t->op == GGML_OP_PERMUTE;
+    };
+
     for (int w = 0; w <= next_window_id; ++w) {
         const window_record & wr = windows[w];
-        if ((int) wr.per_unit_nodes.size() < 2)         continue; // nothing to parallelize
+        if ((int) wr.per_unit_nodes.size() < 3)         continue; // skip small windows where fork/join overhead exceeds parallelism gain
         if (wr.start_pos == 0)                          continue; // no preceding node to use as fork key
         if (wr.end_pos   >= n - 1)                      continue; // no following node to use as join
+
+        // Walk backward from start_pos-1 to find the first non-noop compute node — that's
+        // where the eval loop will actually call try_launch_concurrent_event after compute_forward.
+        int fork_pos = wr.start_pos - 1;
+        while (fork_pos >= 0 && is_noop_op(cgraph->nodes[fork_pos])) {
+            --fork_pos;
+        }
+        if (fork_pos < 0) continue; // window's prefix is all noops; nothing to fork off of
 
         const int n_units    = (int) wr.per_unit_nodes.size();
         const int n_streams  = std::min(n_units, max_forked_streams);
 
-        const ggml_tensor * fork_key = cgraph->nodes[wr.start_pos - 1];
-        const ggml_tensor * join_key = cgraph->nodes[wr.end_pos   + 1];
+        const ggml_tensor * fork_key = cgraph->nodes[fork_pos];
+        const ggml_tensor * join_key = cgraph->nodes[wr.end_pos + 1];
 
         if (concurrent_events.find(fork_key) != concurrent_events.end()) {
-            // fork keys must be unique; should not happen since each window has a distinct preceding node
+            // fork keys must be unique — two windows whose backward-walk landed on the same
+            // compute node share a fork point; skip the second one.
             continue;
         }
 
