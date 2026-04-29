@@ -1,5 +1,6 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
+#include "ggml-mem-ranges.h"
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/common.cuh"
@@ -2298,8 +2299,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    const bool split = ggml_backend_buft_is_cuda_split(ffn_up->src[0]->buffer->buft) ||
-                       ggml_backend_buft_is_cuda_split(ffn_gate->src[0]->buffer->buft);
+    // dryrun-from-graph_optimize may run before buffers are allocated; treat null buffer
+    // as not-split so the optimistic fusion path is taken at scheduling time.
+    const bool split = (ffn_up->src[0]->buffer   && ggml_backend_buft_is_cuda_split(ffn_up->src[0]->buffer->buft)) ||
+                       (ffn_gate->src[0]->buffer && ggml_backend_buft_is_cuda_split(ffn_gate->src[0]->buffer->buft));
 
     //TODO: add support for fusion for split buffers
     if (split) {
@@ -2323,8 +2326,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const int cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
 
-    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
-                       ggml_backend_buft_is_cuda_split(src1->buffer->buft);
+    const bool split = (src0->buffer && ggml_backend_buft_is_cuda_split(src0->buffer->buft)) ||
+                       (src1->buffer && ggml_backend_buft_is_cuda_split(src1->buffer->buft));
 
     //TODO: add support for fusion for split buffers
     if (split) {
@@ -2349,7 +2352,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+    const bool bad_padding_clear = src0->buffer &&
+                                   ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
@@ -2371,8 +2375,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     }
 
 
-    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
-                       ggml_backend_buft_is_cuda_split(src1->buffer->buft);
+    const bool split = (src0->buffer && ggml_backend_buft_is_cuda_split(src0->buffer->buft)) ||
+                       (src1->buffer && ggml_backend_buft_is_cuda_split(src1->buffer->buft));
 
     //TODO: add support for fusion for split buffers
     if (split) {
@@ -3391,6 +3395,14 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           out_count,
                                                  const bool          is_topk_moe = false) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        // Buffers may be unallocated when this is called from the graph_optimize hook
+        // (dryrun pass at scheduling time). Treat unknown ranges as non-overlapping so
+        // the fusion optimistically goes ahead — the live (post-allocation) call will
+        // revisit with real ranges.
+        if (!a->buffer || !b->buffer) {
+            return false;
+        }
+
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
 
@@ -3641,7 +3653,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
-static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+// when dryrun is true, fusion patterns are detected without launching any kernels — the
+// returned skip count is identical, so callers can ask "how many nodes would fuse here?"
+static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, bool dryrun = false) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -3698,7 +3712,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    if (!dryrun) {
+                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    }
                     return ops.size() - 1;
                 }
             } else if (!args.norm && !args.prob_bias) {
@@ -3713,7 +3729,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    if (!dryrun) {
+                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    }
                     return ops.size() - 1;
                 }
             }
@@ -3725,7 +3743,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * rope     = cgraph->nodes[i];
         ggml_tensor * set_rows = cgraph->nodes[i + 2];
 
-        ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
+        if (!dryrun) {
+            ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
+        }
         return 2;
     }
 
@@ -3750,16 +3770,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         n_fuse++;
 
         if (n_fuse > 1) {
-            ggml_tensor fused_node;
-            memcpy(&fused_node, node, sizeof(ggml_tensor));
-            for (int j = 0; j < n_fuse - 1; ++j) {
-                fused_node.src[j + 2] = cgraph->nodes[i + j + 1]->src[1];
-            }
-            fused_node.data = cgraph->nodes[i + n_fuse - 1]->data;
-            if (node->op == GGML_OP_ADD) {
-                ggml_cuda_op_fused_add(*cuda_ctx, &fused_node, n_fuse);
-            } else {
-                ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
+            if (!dryrun) {
+                ggml_tensor fused_node;
+                memcpy(&fused_node, node, sizeof(ggml_tensor));
+                for (int j = 0; j < n_fuse - 1; ++j) {
+                    fused_node.src[j + 2] = cgraph->nodes[i + j + 1]->src[1];
+                }
+                fused_node.data = cgraph->nodes[i + n_fuse - 1]->data;
+                if (node->op == GGML_OP_ADD) {
+                    ggml_cuda_op_fused_add(*cuda_ctx, &fused_node, n_fuse);
+                } else {
+                    ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
+                }
             }
             return n_fuse - 1;
         }
@@ -3824,26 +3846,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * ids  = up_n->src[2];
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n)) {
-                ggml_cuda_mm_fusion_args_host fusion_data{};
-                fusion_data.gate      = gate_n->src[0];
-                fusion_data.x_bias    = up_bias_tensor;
-                fusion_data.gate_bias = gate_bias_tensor;
-                fusion_data.glu_op    = ggml_get_glu_op(glu);
+                if (!dryrun) {
+                    ggml_cuda_mm_fusion_args_host fusion_data{};
+                    fusion_data.gate      = gate_n->src[0];
+                    fusion_data.x_bias    = up_bias_tensor;
+                    fusion_data.gate_bias = gate_bias_tensor;
+                    fusion_data.glu_op    = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                    ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                }
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
                 break;
             }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
-                ggml_cuda_mm_fusion_args_host fusion_data{};
-                fusion_data.gate      = gate_n->src[0];
-                fusion_data.x_bias    = up_bias_tensor;
-                fusion_data.gate_bias = gate_bias_tensor;
-                fusion_data.glu_op    = ggml_get_glu_op(glu);
+                if (!dryrun) {
+                    ggml_cuda_mm_fusion_args_host fusion_data{};
+                    fusion_data.gate      = gate_n->src[0];
+                    fusion_data.x_bias    = up_bias_tensor;
+                    fusion_data.gate_bias = gate_bias_tensor;
+                    fusion_data.glu_op    = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                }
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
                 break;
@@ -3865,22 +3891,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * ids  = up->src[2];
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
-                ggml_cuda_mm_fusion_args_host fusion_data{};
-                fusion_data.gate   = gate->src[0];
-                fusion_data.glu_op = ggml_get_glu_op(glu);
+                if (!dryrun) {
+                    ggml_cuda_mm_fusion_args_host fusion_data{};
+                    fusion_data.gate   = gate->src[0];
+                    fusion_data.glu_op = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                    ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                }
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
             }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
-                ggml_cuda_mm_fusion_args_host fusion_data{};
-                fusion_data.gate   = gate->src[0];
-                fusion_data.glu_op = ggml_get_glu_op(glu);
+                if (!dryrun) {
+                    ggml_cuda_mm_fusion_args_host fusion_data{};
+                    fusion_data.gate   = gate->src[0];
+                    fusion_data.glu_op = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                }
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
@@ -3938,14 +3968,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         fusion_data.x_bias = bias_tensor;
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
-            ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+            if (!dryrun) {
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+            }
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
             break;
         }
 
         if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-            ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+            if (!dryrun) {
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+            }
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
             break;
@@ -3957,34 +3991,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
-        ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        if (!dryrun) {
+            ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        }
         return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        if (!dryrun) {
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
-        ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        if (!dryrun) {
+            ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        if (!dryrun) {
+            ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SQR }, { GGML_UNARY_OP_RELU })) {
-        ggml_cuda_op_relu_sqr(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        if (!dryrun) {
+            ggml_cuda_op_relu_sqr(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
-        ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
+        if (!dryrun) {
+            ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
+        }
         return 2;
     }
 
@@ -4000,7 +4046,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
     bool                         is_concurrent_event_active = false;
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
-    bool                         should_launch_concurrent_events = false;
 
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
@@ -4027,66 +4072,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
-            if (stream_ctx.concurrent_events.size() > 0) {
-                should_launch_concurrent_events = true;
-                for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
-                    should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
+            // Drop only the events that fail validity (overlapping writes or cross-stream
+            // src dependencies). The remaining events still drive concurrency for their windows.
+            for (auto it = stream_ctx.concurrent_events.begin(); it != stream_ctx.concurrent_events.end(); ) {
+                if (!it->second.is_valid()) {
+                    GGML_LOG_DEBUG("dropping invalid concurrent_event at %s\n",
+                                   it->first ? it->first->name : "(null)");
+                    it = stream_ctx.concurrent_events.erase(it);
+                } else {
+                    ++it;
                 }
-            }
-
-            if (should_launch_concurrent_events) {
-                // Restore original node order within each concurrent region to enable fusion within streams
-
-                std::unordered_map<const ggml_tensor *, int> node_to_idx;
-                node_to_idx.reserve(cgraph->n_nodes);
-                for (int i = 0; i < cgraph->n_nodes; ++i) {
-                    node_to_idx[cgraph->nodes[i]] = i;
-                }
-
-                for (auto & [fork_node, event] : stream_ctx.concurrent_events) {
-                    // Find positions of all nodes from this event in the current graph
-                    std::vector<int> positions;
-                    positions.reserve(event.original_order.size());
-
-                    bool all_found = true;
-                    for (const ggml_tensor * orig_node : event.original_order) {
-                        auto it = node_to_idx.find(orig_node);
-                        if (it != node_to_idx.end()) {
-                            positions.push_back(it->second);
-                        } else {
-                            all_found = false;
-                            break;
-                        }
-                    }
-
-                    if (!all_found || positions.size() != event.original_order.size()) {
-                        continue;
-                    }
-
-                    // Sort positions to get contiguous range
-                    std::vector<int> sorted_positions = positions;
-                    std::sort(sorted_positions.begin(), sorted_positions.end());
-
-                    bool is_contiguous = true;
-                    for (size_t i = 1; i < sorted_positions.size(); ++i) {
-                        if (sorted_positions[i] != sorted_positions[i-1] + 1) {
-                            is_contiguous = false;
-                            break;
-                        }
-                    }
-
-                    if (!is_contiguous) {
-                        continue;
-                    }
-
-                    // Restore original order at the sorted positions
-                    int start_pos = sorted_positions[0];
-                    for (size_t i = 0; i < event.original_order.size(); ++i) {
-                        cgraph->nodes[start_pos + i] = const_cast<ggml_tensor *>(event.original_order[i]);
-                    }
-                }
-            } else {
-                stream_ctx.concurrent_events.clear();
             }
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4334,219 +4329,238 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         return;
     }
 
-    // number of out-degrees for a particular node
-    std::unordered_map<const ggml_tensor *, int> fan_out;
-    // reverse mapping of node to index in the cgraph
-    std::unordered_map<const ggml_tensor *, int> node_indices;
+    // Only run the concurrency analysis on graphs that will actually be CUDA-graph captured.
+    // Prefill (large batch) is rejected by check_compability (mul_mat_id ne[2] > mmvq_mmid_max),
+    // and individual prefill kernels are big enough that cross-stream sync overhead would only
+    // hurt; restrict to the small-batch decode path where graph capture amortizes the events.
+#ifdef USE_CUDA_GRAPH
+    if (!ggml_cuda_graph_check_compability(cgraph)) {
+        return;
+    }
+#endif
 
-    const auto & is_noop = [](const ggml_tensor * node) -> bool {
-        return ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
-               node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
+    // mem_ranges-driven concurrency discovery:
+    //   1. pack each maximal fusion span into a single logical "unit" via ggml_cuda_try_fuse(dryrun=true);
+    //      this guarantees that the n_fuse the live evaluator will see at execution time matches what we
+    //      treated as one indivisible op during reorder.
+    //   2. walk units in original order, growing a disjoint set against ggml_mem_ranges; when a unit
+    //      conflicts with the current set we close the window, optionally fattening it via a forward
+    //      look-ahead pass that pulls later independent units forward (Metal-style reorder).
+    //   3. for each closed window of size > 1 we emit a ggml_cuda_concurrent_event, distributing units
+    //      round-robin across forked streams 1..min(n_units, GGML_CUDA_MAX_STREAMS-1).
+
+    const int n = cgraph->n_nodes;
+
+    struct unit {
+        int head;     // first node index in cgraph
+        int n_extra;  // number of additional fused nodes; member span = [head .. head+n_extra]
     };
 
-    const auto & depends_on = [](const ggml_tensor * dst, const ggml_tensor * src) -> bool {
-        for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
-            if (dst->src[s] == src) {
-                return true;
-            }
-        }
-        // implicit dependency if they view the same tensor
-        const ggml_tensor * dst2 = dst->view_src ? dst->view_src : dst;
-        const ggml_tensor * src2 = src->view_src ? src->view_src : src;
-        if (dst2 == src2) {
-            return true;
-        }
-        return false;
-    };
-
-    for (int node_idx = 0; node_idx < cgraph->n_nodes; node_idx++) {
-        const ggml_tensor * node = cgraph->nodes[node_idx];
-        node_indices[node]       = node_idx;
-
-        if (is_noop(node)) {
-            continue;
-        }
-        for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
-            const ggml_tensor * src = cgraph->nodes[node_idx]->src[src_idx];
-            //TODO: check why nrows > 1 fails
-            if (node && !is_noop(node) && ggml_nrows(node) <= 1) {
-                fan_out[src] += 1;
-            }
-        }
+    std::vector<unit> units;
+    units.reserve(n);
+    for (int i = 0; i < n; ) {
+        const int n_extra = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, /*dryrun=*/true);
+        units.push_back({ i, n_extra });
+        i += n_extra + 1;
     }
 
-    // Target Q, K, V for concurrency
-    // this is a more general way to find nodes which can be candidates for concurrency (although it has not been tested for anything else):
-    // 1. find fan-out (fork) nodes where the same input is used at least N times (in QKV, it would be "attn-norm")
-    // 2. find the join node, where 2 or more of the outputs are required (in QKV, this would "KQ" or "flash-attn")
-    // 3. account for all branches from the fork to the join
-    // 4. To extend lifetimes of the tensors, we interleave the branches (see below for more details)
-    // 5. save the original cgraph and restore it in graph_compute, to enable fusion within streams
-    // See discussion: https://github.com/ggml-org/llama.cpp/pull/16991#issuecomment-3522620030
+    const int nu = (int) units.size();
 
-    const int min_fan_out = 3;
-    const int max_fan_out = 3;
+    const auto & unit_is_empty = [&](const unit & u) {
+        for (int k = 0; k <= u.n_extra; ++k) {
+            if (!ggml_op_is_empty(cgraph->nodes[u.head + k]->op)) return false;
+        }
+        return true;
+    };
 
-    // store {fork_idx, join_idx}
-    std::vector<std::pair<int, int>> concurrent_node_ranges;
+    const auto & unit_op = [&](const unit & u) {
+        return cgraph->nodes[u.head]->op;
+    };
 
-    for (const auto & [root_node, count] : fan_out) {
-        if (count >= min_fan_out && count <= max_fan_out) {
-            const int root_node_idx = node_indices[root_node];
+    // ops that are pure-functional-on-srcs and safe to pull forward across other ops
+    const auto & h_safe = [](ggml_op op) {
+        switch (op) {
+            case GGML_OP_MUL_MAT:
+            case GGML_OP_MUL_MAT_ID:
+            case GGML_OP_ROPE:
+            case GGML_OP_NORM:
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_GROUP_NORM:
+            case GGML_OP_L2_NORM:
+            case GGML_OP_MUL:
+            case GGML_OP_ADD:
+            case GGML_OP_SUB:
+            case GGML_OP_DIV:
+            case GGML_OP_GLU:
+            case GGML_OP_SCALE:
+            case GGML_OP_UNARY:
+            case GGML_OP_GET_ROWS:
+            case GGML_OP_SET_ROWS:
+            case GGML_OP_CPY:
+            case GGML_OP_CONT:
+            case GGML_OP_SSM_CONV:
+            case GGML_OP_GATED_DELTA_NET:
+                return true;
+            default:
+                return ggml_op_is_empty(op);
+        }
+    };
 
-            // only optimize for attn_norm
-            // TODO: make this more generic
-            if (!strstr(root_node->name, "attn_norm")) {
-                continue;
-            }
-
-            bool is_part_of_event = false;
-            for (const auto & [start, end] : concurrent_node_ranges) {
-                if (root_node_idx >= start && root_node_idx <= end) {
-                    is_part_of_event = true;
-                }
-            }
-
-            if (is_part_of_event) {
-                continue;
-            }
-
-            std::vector<std::vector<const ggml_tensor *>> nodes_per_branch;
-            for (int i = root_node_idx + 1; i < cgraph->n_nodes; ++i) {
-                const ggml_tensor * node = cgraph->nodes[i];
-                if (!is_noop(node) && depends_on(node, root_node)) {
-                    nodes_per_branch.push_back({ node });
-                }
-            }
-
-            GGML_ASSERT(nodes_per_branch.size() == (size_t) count);
-
-            //find the join point
-            const ggml_tensor * join_node = nullptr;
-
-            const auto & belongs_to_branch = [&](const ggml_tensor *                      node,
-                                                 const std::vector<const ggml_tensor *> & branch) -> bool {
-                for (const ggml_tensor * n : branch) {
-                    if (depends_on(node, n)) {
-                        return true;
-                    }
-                }
-                return false;
-            };
-
-            for (int i = root_node_idx + 1; i < cgraph->n_nodes; ++i) {
-                const ggml_tensor * curr_node = cgraph->nodes[i];
-
-                int num_joins = 0;
-                for (size_t branch_idx = 0; branch_idx < nodes_per_branch.size(); branch_idx++) {
-                    if (belongs_to_branch(curr_node, nodes_per_branch[branch_idx])) {
-                        num_joins++;
-                    }
-                }
-
-                if (num_joins >= 2) {
-                    join_node = curr_node;
-                    break;
-                }
-
-                bool found_branch = false;
-                for (size_t branch_idx = 0; branch_idx < nodes_per_branch.size(); branch_idx++) {
-                    std::vector<const ggml_tensor *> & branch_vec = nodes_per_branch[branch_idx];
-                    if (belongs_to_branch(curr_node, branch_vec)) {
-                        //continue accumulating
-                        if (std::find(branch_vec.begin(), branch_vec.end(), curr_node) == branch_vec.end()) {
-                            branch_vec.push_back(curr_node);
-                        }
-                        found_branch = true;
-                    }
-                }
-
-                if (!found_branch && is_noop(curr_node)) {
-                    // we can put it in any branch because it will be ignored
-                    nodes_per_branch[0].push_back({ curr_node });
-                }
-            }
-
-            if (join_node) {
-                //Create ggml_cuda_concurrent_event
-                ggml_cuda_concurrent_event concurrent_event(nodes_per_branch.size());
-                concurrent_event.join_node = join_node;
-
-                for (size_t branch_idx = 0; branch_idx < nodes_per_branch.size(); branch_idx++) {
-                    for (const ggml_tensor * n : nodes_per_branch[branch_idx]) {
-                        concurrent_event.stream_mapping[n] = branch_idx + 1;
-                    }
-                }
-
-                int fork_node_idx = node_indices[root_node];
-                int join_node_idx = node_indices[join_node];
-
-                int       current_branch_idx = 0;
-                int       current_node_idx   = fork_node_idx + 1;
-                const int n_branches         = nodes_per_branch.size();
-
-                int total_branch_nodes = 0;
-                for (std::vector<const ggml_tensor *> branch_nodes : nodes_per_branch) {
-                    total_branch_nodes += branch_nodes.size();
-                }
-
-                // there are other nodes in the middle which are unaccounted for
-                // usually (cpy) nodes, then ignore this fork
-                if (join_node_idx - fork_node_idx - 1 != total_branch_nodes) {
-                    GGML_LOG_DEBUG(
-                        "Skipping %s because the number of nodes in the middle is not equal to the total number of "
-                        "branch nodes %d != %d\n",
-                        root_node->name, join_node_idx - fork_node_idx - 1, total_branch_nodes);
-                    continue;
-                }
-
-                // Save the original order of nodes in this region before interleaving
-                // This is used later to restore grouping for fusion within streams
-                concurrent_event.original_order.reserve(total_branch_nodes);
-                for (int i = fork_node_idx + 1; i < join_node_idx; ++i) {
-                    concurrent_event.original_order.push_back(cgraph->nodes[i]);
-                }
-
-                std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> & concurrent_events = cuda_ctx->stream_context().concurrent_events;
-                GGML_ASSERT(concurrent_events.find(root_node) == concurrent_events.end());
-                concurrent_events.emplace(root_node, std::move(concurrent_event));
-                GGML_LOG_DEBUG("Adding stream at node %s %p\n", root_node->name, root_node);
-                concurrent_node_ranges.emplace_back(fork_node_idx, join_node_idx);
-
-                // interleave tensors to extend lifetimes so that ggml graph doesn't recycle them
-                // example transformation:
-                // [attn-norm, QMul, QNorm, QRope, KMul, KNorm, KRope, VMul, attn] ->
-                // [attn-norm, QMul, KMul, VMul, QNorm, VNorm, QRope, KRope, attn]
-                while (current_node_idx < join_node_idx) {
-                    std::vector<const ggml_tensor *> & branch_nodes = nodes_per_branch[current_branch_idx];
-
-                    bool has_node = false;
-                    for (std::vector<const ggml_tensor *> branch_node : nodes_per_branch) {
-                        has_node |= branch_node.size() > 0;
-                    }
-
-                    GGML_ASSERT(has_node);
-
-                    if (branch_nodes.empty()) {
-                        current_branch_idx = (current_branch_idx + 1) % n_branches;
-                        continue;
-                    }
-
-                    cgraph->nodes[current_node_idx] = const_cast<ggml_tensor *>(branch_nodes.front());
-                    current_node_idx++;
-                    branch_nodes.erase(branch_nodes.begin());
-
-                    // append all empty nodes
-                    while (!branch_nodes.empty() && is_noop(branch_nodes.front())) {
-                        cgraph->nodes[current_node_idx] = const_cast<ggml_tensor *>(branch_nodes.front());
-                        current_node_idx++;
-                        branch_nodes.erase(branch_nodes.begin());
-                    }
-
-                    current_branch_idx = (current_branch_idx + 1) % n_branches;
-                }
+    const auto & unit_add = [&](ggml_mem_ranges_t mrs, const unit & u) {
+        for (int k = 0; k <= u.n_extra; ++k) {
+            const ggml_tensor * t = cgraph->nodes[u.head + k];
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (t->src[s] && !ggml_mem_ranges_add_src(mrs, t->src[s])) return false;
             }
         }
+        return ggml_mem_ranges_add_dst(mrs, cgraph->nodes[u.head + u.n_extra]);
+    };
+
+    const auto & unit_check = [&](ggml_mem_ranges_t mrs, const unit & u) {
+        for (int k = 0; k <= u.n_extra; ++k) {
+            const ggml_tensor * t = cgraph->nodes[u.head + k];
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (t->src[s] && !ggml_mem_ranges_check_src(mrs, t->src[s])) return false;
+            }
+        }
+        return ggml_mem_ranges_check_dst(mrs, cgraph->nodes[u.head + u.n_extra]);
+    };
+
+    std::vector<bool> used(nu, false);
+    std::vector<int>  order;
+    order.reserve(nu);
+
+    // window_id[k] = which concurrent window (in execution order) the unit at order[k] belongs to;
+    // a window is a maximal run of mutually independent units.
+    std::vector<int> window_id;
+    window_id.reserve(nu);
+    int next_window_id = 0;
+
+    ggml_mem_ranges_t mrs0 = ggml_mem_ranges_init(0); // current window's range set
+    ggml_mem_ranges_t mrs1 = ggml_mem_ranges_init(0); // skipped-but-not-yet-emitted set, used during forward look-ahead
+
+    for (int i0 = 0; i0 < nu; ++i0) {
+        if (used[i0]) continue;
+
+        const unit & u0 = units[i0];
+
+        // u0 conflicts with current window: try to fatten the window first by pulling forward any later
+        // independent unit, then start a fresh window with u0.
+        if (!unit_is_empty(u0) && !unit_check(mrs0, u0)) {
+            ggml_mem_ranges_reset(mrs1);
+            unit_add(mrs1, u0);
+
+            constexpr int N_FORWARD = 64;
+            for (int i1 = i0 + 1; i1 < i0 + N_FORWARD && i1 < nu; ++i1) {
+                if (used[i1]) continue;
+
+                const unit & u1 = units[i1];
+                if (!h_safe(unit_op(u1))) break;
+
+                const bool is_empty = unit_is_empty(u1);
+                if ((is_empty || unit_check(mrs0, u1)) && unit_check(mrs1, u1)) {
+                    unit_add(mrs0, u1);
+                    order.push_back(i1);
+                    window_id.push_back(next_window_id);
+                    used[i1] = true;
+                } else {
+                    unit_add(mrs1, u1);
+                }
+            }
+
+            ggml_mem_ranges_reset(mrs0);
+            ++next_window_id;
+        }
+
+        unit_add(mrs0, u0);
+        order.push_back(i0);
+        window_id.push_back(next_window_id);
+    }
+
+    ggml_mem_ranges_free(mrs0);
+    ggml_mem_ranges_free(mrs1);
+
+    // count units per window so we know which windows are worth a concurrent_event
+    std::vector<int> units_in_window(next_window_id + 1, 0);
+    for (int w : window_id) {
+        units_in_window[w]++;
+    }
+
+    // Build the new node list and, simultaneously, find each window's [first_pos, last_pos] in
+    // the reordered graph along with each member unit's head. We need:
+    //   - fork key = last node of the unit IMMEDIATELY BEFORE the window's first unit
+    //   - join_node = first node of the unit IMMEDIATELY AFTER the window's last unit
+    //   - stream_mapping = every node within the window mapped round-robin to streams 1..n_streams
+    std::vector<ggml_tensor *> new_nodes;
+    new_nodes.reserve(n);
+
+    struct window_record {
+        int                                  start_pos = -1; // index in new_nodes of first node of first unit
+        int                                  end_pos   = -1; // index in new_nodes of last node of last unit
+        std::vector<std::vector<const ggml_tensor *>> per_unit_nodes; // nodes belonging to each member unit
+    };
+    std::vector<window_record> windows(next_window_id + 1);
+
+    for (size_t k = 0; k < order.size(); ++k) {
+        const unit & u  = units[order[k]];
+        const int    w  = window_id[k];
+        const int    pos_before_unit = (int) new_nodes.size();
+
+        std::vector<const ggml_tensor *> unit_nodes;
+        unit_nodes.reserve(u.n_extra + 1);
+        for (int j = 0; j <= u.n_extra; ++j) {
+            new_nodes.push_back(cgraph->nodes[u.head + j]);
+            unit_nodes.push_back(cgraph->nodes[u.head + j]);
+        }
+
+        if (windows[w].start_pos < 0) {
+            windows[w].start_pos = pos_before_unit;
+        }
+        windows[w].end_pos = (int) new_nodes.size() - 1;
+        windows[w].per_unit_nodes.push_back(std::move(unit_nodes));
+    }
+
+    GGML_ASSERT((int) new_nodes.size() == n);
+    for (int i = 0; i < n; ++i) {
+        cgraph->nodes[i] = new_nodes[i];
+    }
+
+    // Emit a concurrent_event for each window with > 1 unit, where there is a node both before and
+    // after the window (we need a fork key and a join key). Single-unit windows just run on the main
+    // stream — no fork/join needed.
+    auto & concurrent_events = cuda_ctx->stream_context().concurrent_events;
+    constexpr int max_forked_streams = GGML_CUDA_MAX_STREAMS - 1; // stream 0 is the main stream
+
+    for (int w = 0; w <= next_window_id; ++w) {
+        const window_record & wr = windows[w];
+        if ((int) wr.per_unit_nodes.size() < 2)         continue; // nothing to parallelize
+        if (wr.start_pos == 0)                          continue; // no preceding node to use as fork key
+        if (wr.end_pos   >= n - 1)                      continue; // no following node to use as join
+
+        const int n_units    = (int) wr.per_unit_nodes.size();
+        const int n_streams  = std::min(n_units, max_forked_streams);
+
+        const ggml_tensor * fork_key = cgraph->nodes[wr.start_pos - 1];
+        const ggml_tensor * join_key = cgraph->nodes[wr.end_pos   + 1];
+
+        if (concurrent_events.find(fork_key) != concurrent_events.end()) {
+            // fork keys must be unique; should not happen since each window has a distinct preceding node
+            continue;
+        }
+
+        ggml_cuda_concurrent_event ev(n_streams);
+        ev.join_node = join_key;
+
+        for (int u_idx = 0; u_idx < n_units; ++u_idx) {
+            const int stream_idx = (u_idx % n_streams) + 1; // round-robin across forked streams
+            for (const ggml_tensor * t : wr.per_unit_nodes[u_idx]) {
+                ev.stream_mapping[t] = stream_idx;
+            }
+        }
+
+        concurrent_events.emplace(fork_key, std::move(ev));
+        GGML_LOG_DEBUG("graph_optimize: window of %d units across %d streams (fork at %s, join at %s)\n",
+                       n_units, n_streams, fork_key->name, join_key->name);
     }
 }
 
