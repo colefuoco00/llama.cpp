@@ -623,7 +623,12 @@ struct common_speculative_state_mtp : public common_speculative_state {
         {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 1;
+            // top_k > 1 so the auto-appended DIST sampler softmaxes over multiple
+            // candidates and populates cur_p->data[0].p with a real probability
+            // (with top_k=1, DIST short-circuits and sets p=1.0 unconditionally,
+            // which would make any p_min check a no-op). Sampling stays
+            // effectively-greedy because the draft loop reads cur_p->data[0].id.
+            sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             smpl = common_sampler_init(model_mtp, sparams);
         }
@@ -730,11 +735,24 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 return;
             }
 
-            const llama_token best = common_sampler_sample(smpl, ctx_mtp, 0);
-            common_sampler_accept(smpl, best, /*accept_grammar=*/ false);
+            common_sampler_sample(smpl, ctx_mtp, 0);
+            const auto * cur_p = common_sampler_get_candidates(smpl, true);
+            const llama_token best = cur_p->data[0].id;
+            common_sampler_accept(smpl, best, /*is_generated=*/ false);
+
             draft_tokens.push_back(best);
             cond_tok = best;
             ++pos;
+
+            // p_min early-stop: stop drafting once MTP's confidence falls
+            // below threshold. The current token is kept (we always return
+            // at least one draft) so the caller's spec_draft is never empty;
+            // returning empty would skip the spec verify path and leave
+            // last_n_accepted out of sync with t_h_pre_norm rows on the
+            // following call.
+            if (cur_p->data[0].p < params.draft.p_min) {
+                break;
+            }
         }
 
         last_n_drafted = (uint16_t) draft_tokens.size();
