@@ -302,7 +302,7 @@
 <div class="strip">
   <div class="inner">
     <span class="left">An Engineering Library</span>
-    <span>llama.cpp · gemma4-mtp</span>
+    <span>llama.cpp</span>
   </div>
 </div>
 
@@ -310,7 +310,7 @@
 <!--                            COVER                              -->
 <!-- ============================================================ -->
 <section class="cover">
-  <div class="cover-eyebrow fade-up">Four short monographs, one codebase</div>
+  <div class="cover-eyebrow fade-up">Three short monographs, one codebase</div>
 
   <h1 class="cover-title fade-up d1">
     Notes on<br>
@@ -325,9 +325,8 @@
   </p>
 
   <div class="cover-meta fade-up d4">
-    <div class="item"><span class="k">Works</span><span class="v">Four</span></div>
+    <div class="item"><span class="k">Works</span><span class="v">Three</span></div>
     <div class="item"><span class="k">Source</span><span class="v">llama.cpp tree</span></div>
-    <div class="item"><span class="k">Branch</span><span class="v">gemma4-mtp</span></div>
     <div class="item"><span class="k">Audience</span><span class="v">Implementers</span></div>
   </div>
 </section>
@@ -338,7 +337,7 @@
 <section class="catalogue">
   <div class="catalogue-label">
     <span>Catalogue</span>
-    <span>I — IV</span>
+    <span>I — III</span>
   </div>
 
   <ol class="works">
@@ -465,87 +464,7 @@
       </div>
     </li>
 
-    <!-- ====== III. KV Sharing ====== -->
-    <li onclick="location.href='kv-sharing.html'">
-      <div class="glyph" aria-hidden="true">
-        <svg viewBox="0 0 200 150" xmlns="http://www.w3.org/2000/svg">
-          <rect width="200" height="150" fill="#e7decb"/>
-          <!-- trunk: 60 stacked layers -->
-          <g fill="#354152" opacity="0.85">
-            <rect x="20" y="14" width="14" height="120"/>
-          </g>
-          <g fill="#1a1715" opacity="0.18">
-            <g>
-              <line x1="20" y1="20" x2="34" y2="20" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="28" x2="34" y2="28" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="36" x2="34" y2="36" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="44" x2="34" y2="44" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="52" x2="34" y2="52" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="60" x2="34" y2="60" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="68" x2="34" y2="68" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="76" x2="34" y2="76" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="84" x2="34" y2="84" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="92" x2="34" y2="92" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="100" x2="34" y2="100" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="108" x2="34" y2="108" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="116" x2="34" y2="116" stroke="#f1e9d4" stroke-width="0.5"/>
-              <line x1="20" y1="124" x2="34" y2="124" stroke="#f1e9d4" stroke-width="0.5"/>
-            </g>
-          </g>
-          <!-- arrows: 4 MTP heads sharing -->
-          <g stroke="#b73a26" stroke-width="1.3" fill="none">
-            <path d="M 34 30 L 110 30"/>
-            <path d="M 34 55 L 110 55"/>
-            <path d="M 34 80 L 110 80"/>
-            <path d="M 34 105 L 110 105"/>
-          </g>
-          <g fill="#b73a26">
-            <polygon points="110,30 104,26 104,34"/>
-            <polygon points="110,55 104,51 104,59"/>
-            <polygon points="110,80 104,76 104,84"/>
-            <polygon points="110,105 104,101 104,109"/>
-          </g>
-          <!-- MTP blocks -->
-          <g fill="#b73a26" opacity="0.9">
-            <rect x="115" y="22" width="60" height="16"/>
-            <rect x="115" y="47" width="60" height="16"/>
-            <rect x="115" y="72" width="60" height="16"/>
-            <rect x="115" y="97" width="60" height="16"/>
-          </g>
-          <g font-family="JetBrains Mono, monospace" font-size="8" fill="#f1e9d4">
-            <text x="125" y="33" letter-spacing="0.08em">mtp 0</text>
-            <text x="125" y="58" letter-spacing="0.08em">mtp 1</text>
-            <text x="125" y="83" letter-spacing="0.08em">mtp 2</text>
-            <text x="125" y="108" letter-spacing="0.08em">mtp 3</text>
-          </g>
-        </svg>
-      </div>
-
-      <div class="body">
-        <div class="kicker"><span class="num">III.</span>One essay · ~28 KB</div>
-        <a class="title-link" href="kv-sharing.html">
-          <h2>Gemma 4 MTP &mdash; <em>sharing</em> the trunk cache</h2>
-        </a>
-        <p class="blurb">
-          How the four MTP heads of Gemma 4 reuse the 60-layer main model's KV cache
-          rather than computing their own, and the bookkeeping that keeps the shared
-          state honest across speculative draft &amp; verify cycles.
-        </p>
-        <ul class="ttls">
-          <li>Layer reuse</li>
-          <li>Stream layout</li>
-          <li>MTP heads</li>
-          <li>Speculative decode</li>
-        </ul>
-      </div>
-
-      <div class="right">
-        <span class="pg">Vol. III</span>
-        <a class="read" href="kv-sharing.html" onclick="event.stopPropagation()">Read</a>
-      </div>
-    </li>
-
-    <!-- ====== IV. Importance Matrix ====== -->
+    <!-- ====== III. Importance Matrix ====== -->
     <li onclick="location.href='imatrix.html'">
       <div class="glyph" aria-hidden="true">
         <svg viewBox="0 0 200 150" xmlns="http://www.w3.org/2000/svg">
@@ -630,7 +549,7 @@
       </div>
 
       <div class="body">
-        <div class="kicker"><span class="num">IV.</span>One note · ~27 KB</div>
+        <div class="kicker"><span class="num">III.</span>One note · ~27 KB</div>
         <a class="title-link" href="imatrix.html">
           <h2>The <em>Importance</em> Matrix</h2>
         </a>
@@ -647,7 +566,7 @@
       </div>
 
       <div class="right">
-        <span class="pg">Vol. IV</span>
+        <span class="pg">Vol. III</span>
         <a class="read" href="imatrix.html" onclick="event.stopPropagation()">Read</a>
       </div>
     </li>
@@ -659,9 +578,8 @@
   <p>
     Set in <em>Fraunces</em> and <em>Newsreader</em>, with <em>JetBrains Mono</em> for code.
     Source lives in this repository under <code>kv-cache-explainer/</code>,
-    <code>recurrent-cache.html</code>, <code>kv-sharing.html</code>, and
-    <code>imatrix.html</code>. Each work is self-contained and reads cold; the
-    catalogue above is only a suggested order.
+    <code>recurrent-cache.html</code>, and <code>imatrix.html</code>. Each work
+    is self-contained and reads cold; the catalogue above is only a suggested order.
   </p>
 </section>
 
