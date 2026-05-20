@@ -1,0 +1,1034 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Recurrent Cache &amp; Slot Rollback — llama.cpp</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT@9..144,300..900,0..100&family=Newsreader:ital,opsz,wght@0,6..72,200..800;1,6..72,200..800&family=JetBrains+Mono:wght@300..700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper:       #f1e9d4;
+    --paper-2:     #e7decb;
+    --paper-3:     #ddd2b8;
+    --paper-4:     #d5c9a4;
+    --ink:         #1a1715;
+    --ink-soft:    #3a342c;
+    --rule:        #c8b890;
+    --rule-soft:   #d8caa8;
+    --accent:      #b73a26;
+    --accent-2:    #7a3a1c;
+    --slate:       #354152;
+    --mute:        #8d7e5c;
+    --highlight:   #f7e9a8;
+    --code-bg:     #e6dcbe;
+    --code-border: #c8b890;
+    --good:        #4a6b2e;
+    --teal:        #2e6b6b;
+    --indigo:      #3b4a7a;
+
+    --display:  'Fraunces','EB Garamond',Georgia,serif;
+    --body:     'Newsreader','EB Garamond',Georgia,serif;
+    --mono:     'JetBrains Mono','IBM Plex Mono','Menlo',monospace;
+
+    --main-col:   46rem;
+    --margin-col: 14rem;
+    --gutter:     2.25rem;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 18px;
+    line-height: 1.62;
+    font-feature-settings: "kern","liga","onum";
+    font-variation-settings: "opsz" 16;
+    background-image:
+      radial-gradient(ellipse 80% 60% at 10% 0%, rgba(255,255,255,.45) 0%, transparent 60%),
+      radial-gradient(ellipse 60% 50% at 100% 100%, rgba(120,90,40,.06) 0%, transparent 60%),
+      repeating-linear-gradient(0deg, transparent 0, transparent 2px, rgba(50,30,10,.012) 2px, rgba(50,30,10,.012) 3px);
+  }
+
+  .running-head {
+    position: sticky; top: 0; z-index: 50;
+    background: var(--paper);
+    border-bottom: 1px solid var(--ink);
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.18em; text-transform: uppercase;
+  }
+  .running-head .inner {
+    max-width: calc(var(--main-col) + var(--margin-col) + var(--gutter) + 4rem);
+    margin: 0 auto; padding: 0.65rem 2rem;
+    display: flex; justify-content: space-between; align-items: baseline; gap: 1rem;
+  }
+  .running-head .title { color: var(--accent); font-weight: 600; }
+  .running-head .folio { color: var(--ink-soft); }
+
+  .page {
+    max-width: calc(var(--main-col) + var(--margin-col) + var(--gutter) + 4rem);
+    margin: 0 auto; padding: 4rem 2rem 6rem;
+    display: grid;
+    grid-template-columns: var(--main-col) var(--margin-col);
+    column-gap: var(--gutter);
+    align-items: start;
+  }
+  .page > * { grid-column: 1; }
+  .page > aside.margin { grid-column: 2; }
+  .page > .full { grid-column: 1 / -1; }
+
+  .chapter-head {
+    margin-top: 1rem; margin-bottom: 3.5rem;
+    border-bottom: 1px solid var(--ink); padding-bottom: 1.5rem;
+    display: grid; grid-template-columns: auto 1fr;
+    column-gap: 2.25rem; align-items: end;
+  }
+  .chapter-number {
+    font-family: var(--display); font-style: italic; font-weight: 300;
+    font-size: clamp(4rem, 9vw, 7.5rem); line-height: 0.9;
+    color: var(--accent);
+    font-variation-settings: "opsz" 144, "SOFT" 100;
+    letter-spacing: -0.02em;
+  }
+  .chapter-meta {
+    text-align: right; font-family: var(--mono);
+    font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--ink-soft);
+  }
+  .chapter-meta .kicker { color: var(--accent); }
+
+  .chapter-title {
+    grid-column: 1/-1;
+    font-family: var(--display); font-weight: 400;
+    font-size: clamp(2.4rem, 5.5vw, 4rem); line-height: 1.02;
+    letter-spacing: -0.018em; margin: 0.5rem 0 0;
+    font-variation-settings: "opsz" 144, "SOFT" 30;
+  }
+  .chapter-subtitle {
+    grid-column: 1/-1; font-family: var(--body); font-style: italic;
+    font-weight: 300; color: var(--ink-soft);
+    font-size: 1.2rem; line-height: 1.4; margin: 0.85rem 0 0; max-width: 38rem;
+  }
+
+  h2 {
+    font-family: var(--display); font-weight: 500;
+    font-size: 1.6rem; letter-spacing: -0.012em;
+    margin: 3.5rem 0 0.8rem;
+    font-variation-settings: "opsz" 60;
+    position: relative;
+  }
+  h2::before {
+    content: attr(data-section);
+    position: absolute; left: -3.4rem; top: 0.45rem;
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.18em; color: var(--accent); font-weight: 500;
+  }
+  h3 {
+    font-family: var(--display); font-weight: 500; font-style: italic;
+    font-size: 1.2rem; margin: 2.2rem 0 0.5rem;
+    color: var(--ink); font-variation-settings: "opsz" 36, "SOFT" 60;
+  }
+
+  p { margin: 0 0 1.05em; hyphens: auto; text-align: justify; }
+  p + p { text-indent: 1.4em; }
+  p.lede {
+    font-size: 1.18rem; line-height: 1.5;
+    color: var(--ink-soft); font-style: italic;
+    margin-bottom: 2rem; text-indent: 0; text-align: left;
+  }
+  p.lede + p { text-indent: 0; }
+
+  p.dropcap::first-letter {
+    font-family: var(--display); font-weight: 600;
+    font-size: 4.6em; line-height: 0.82;
+    float: left; margin: 0.06em 0.08em 0 -0.04em;
+    color: var(--accent); font-variation-settings: "opsz" 144, "SOFT" 0;
+  }
+  strong { font-weight: 600; color: var(--ink); }
+  em     { font-style: italic; }
+  .term  { font-style: italic; color: var(--accent-2); }
+  a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--rule); }
+  a:hover { border-bottom-color: var(--accent); }
+
+  code {
+    font-family: var(--mono); font-size: 0.86em;
+    background: var(--code-bg); padding: 0.05em 0.3em; border-radius: 2px;
+    font-feature-settings: "calt" 0;
+  }
+  pre {
+    font-family: var(--mono); font-size: 13px; line-height: 1.55;
+    background: var(--code-bg);
+    border: 1px solid var(--code-border); border-left: 3px solid var(--accent);
+    padding: 1rem 1.2rem; margin: 1.5rem 0;
+    overflow-x: auto; white-space: pre; position: relative;
+  }
+  pre code { background: transparent; padding: 0; }
+  pre .cmt { color: var(--mute); font-style: italic; }
+  pre .kw  { color: var(--accent); }
+  pre .typ { color: var(--slate); font-weight: 500; }
+  pre .str { color: var(--good); }
+  pre .num { color: var(--accent-2); }
+  pre .fn  { color: var(--ink); font-weight: 600; }
+  pre .lbl {
+    position: absolute; top: -10px; right: 12px;
+    background: var(--paper); padding: 0 0.5rem;
+    font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--ink-soft); border: 1px solid var(--code-border);
+  }
+
+  aside.margin {
+    font-family: var(--body); font-size: 14px; line-height: 1.45;
+    color: var(--ink-soft); font-style: italic;
+    border-top: 1px solid var(--ink); padding-top: 0.45rem; margin-top: 0.5rem;
+  }
+  aside.margin .ref {
+    display: block; font-family: var(--mono); font-style: normal;
+    font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 0.4rem;
+  }
+
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--paper-2);
+    padding: 1rem 1.25rem; margin: 1.5rem 0;
+    font-size: 0.96em;
+  }
+  .callout .label {
+    display: inline-block; font-family: var(--mono);
+    font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 0.4rem;
+  }
+  .callout p:last-child { margin-bottom: 0; }
+
+  figure { margin: 2.5rem 0; grid-column: 1 / -1; }
+  figure svg { display: block; max-width: 100%; height: auto; }
+  figcaption {
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-soft);
+    margin-top: 0.8rem; padding-top: 0.5rem; border-top: 1px solid var(--rule);
+    display: flex; justify-content: space-between; align-items: baseline; gap: 1rem;
+  }
+  figcaption .fig-num { color: var(--accent); flex-shrink: 0; }
+  figcaption .fig-desc {
+    text-transform: none; letter-spacing: 0; font-style: italic;
+    font-family: var(--body); font-size: 13px; color: var(--ink-soft);
+    text-align: right; flex: 1;
+  }
+
+  ul, ol { padding-left: 1.4em; margin: 0 0 1.2em; }
+  li { margin-bottom: 0.45em; }
+  ul.dashes { list-style: none; padding-left: 0; }
+  ul.dashes li { position: relative; padding-left: 1.6em; }
+  ul.dashes li::before {
+    content: '—'; position: absolute; left: 0;
+    color: var(--accent); font-weight: 500;
+  }
+
+  .diagram-frame {
+    border: 1px solid var(--ink);
+    background:
+      repeating-linear-gradient(0deg, transparent 0, transparent 22px, rgba(40,30,10,.04) 22px, rgba(40,30,10,.04) 23px),
+      var(--paper-2);
+    padding: 1.5rem;
+  }
+  .dg-text       { font-family: var(--mono); font-size: 11px; fill: var(--ink); letter-spacing: 0.04em; }
+  .dg-label      { font-family: var(--mono); font-size: 10px; fill: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.14em; }
+  .dg-title      { font-family: var(--display); font-style: italic; fill: var(--accent); font-size: 15px; }
+  .dg-stroke     { stroke: var(--ink); fill: none; stroke-width: 1.2; }
+  .dg-stroke-soft{ stroke: var(--rule-soft); fill: none; stroke-width: 1; }
+  .dg-accent     { stroke: var(--accent); fill: none; stroke-width: 1.4; }
+  .dg-fill       { fill: var(--paper); stroke: var(--ink); stroke-width: 1; }
+  .dg-fill-soft  { fill: var(--paper-2); stroke: var(--ink); stroke-width: 1; }
+  .dg-dashed     { stroke-dasharray: 3 3; }
+
+  /* ====== interactive controls ====== */
+  .controls {
+    display: flex; gap: 0.6rem; align-items: center;
+    margin-top: 0.75rem; flex-wrap: wrap;
+  }
+  .controls button {
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    background: var(--paper); border: 1px solid var(--ink); color: var(--ink);
+    padding: 0.5rem 0.95rem; cursor: pointer; transition: all 120ms;
+  }
+  .controls button:hover { background: var(--ink); color: var(--paper); }
+  .controls button.primary { background: var(--accent); color: var(--paper); border-color: var(--accent); }
+  .controls button.primary:hover { background: var(--accent-2); border-color: var(--accent-2); }
+  .controls button:disabled { opacity: 0.35; cursor: not-allowed; }
+  .controls button:disabled:hover { background: var(--paper); color: var(--ink); }
+  .controls .status {
+    font-family: var(--mono); font-size: 11px;
+    color: var(--ink-soft); margin-left: auto;
+  }
+  .controls .input-pair {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    font-family: var(--mono); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.12em;
+    color: var(--ink-soft);
+  }
+  .controls input[type=number] {
+    width: 3.5rem; font-family: var(--mono); font-size: 12px;
+    border: 1px solid var(--ink); padding: 0.3rem 0.4rem;
+    background: var(--paper); color: var(--ink);
+  }
+  .controls select {
+    font-family: var(--mono); font-size: 11px;
+    border: 1px solid var(--ink); padding: 0.4rem 0.5rem;
+    background: var(--paper); color: var(--ink);
+    text-transform: uppercase; letter-spacing: 0.1em;
+  }
+
+  /* ====== snapshot plane viewer ====== */
+  .planes {
+    display: grid; gap: 0.65rem;
+    font-family: var(--mono);
+  }
+  .plane-row {
+    display: grid;
+    grid-template-columns: 7rem 1fr;
+    align-items: stretch; gap: 0.65rem;
+  }
+  .plane-label {
+    font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--ink-soft); display: flex; flex-direction: column; justify-content: center;
+    padding: 0.4rem 0.5rem; border-right: 2px solid var(--accent);
+    background: rgba(247,233,168,.4);
+  }
+  .plane-label .ttl { color: var(--accent); font-weight: 600; }
+  .plane-label.snapshot .ttl { color: var(--ink-soft); }
+  .plane-label.snapshot { border-right-color: var(--rule); background: transparent; }
+  .plane-label.snapshot.live { border-right-color: var(--accent); background: rgba(247,233,168,.4); }
+  .plane-label.snapshot.live .ttl { color: var(--accent); }
+
+  .plane-cells {
+    display: grid; gap: 3px; grid-auto-flow: column; grid-auto-columns: 1fr;
+  }
+  .pcell {
+    aspect-ratio: 1.05;
+    background: var(--paper-3);
+    border: 1px solid var(--rule);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    font-size: 11px; transition: all 200ms ease;
+    position: relative;
+  }
+  .pcell .pos { font-size: 14px; color: var(--ink); font-weight: 600; }
+  .pcell .lbl { font-size: 8px; letter-spacing: 0.08em; color: var(--ink-soft); }
+  .pcell.empty { background: var(--paper); color: var(--mute); }
+  .pcell.empty .pos { color: var(--mute); }
+  .pcell.s0 { background: #d8c8a0; }
+  .pcell.s1 { background: #b8c8a0; }
+  .pcell.s2 { background: #b9c4d6; }
+  .pcell.current { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .pcell.copy-src { outline: 2px dashed var(--accent-2); outline-offset: 2px; }
+  .pcell.faded { opacity: 0.35; }
+
+  /* ====== seq token strip ====== */
+  .seq-strip {
+    display: flex; flex-wrap: wrap; gap: 4px; margin: 0.5rem 0 0;
+    font-family: var(--mono); font-size: 12px;
+  }
+  .tok {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 1.75rem; height: 1.75rem;
+    background: var(--paper-2); border: 1px solid var(--rule);
+    color: var(--ink);
+  }
+  .tok.active { background: var(--accent); color: var(--paper); border-color: var(--accent); }
+  .tok.dropped { background: var(--paper); color: var(--mute); border-style: dashed; opacity: 0.55; }
+
+  /* ====== legend ====== */
+  .legend {
+    display: flex; gap: 1.2rem; flex-wrap: wrap;
+    font-family: var(--mono); font-size: 11px;
+    color: var(--ink-soft); margin-top: 0.6rem;
+    letter-spacing: 0.06em;
+  }
+  .legend .item { display: inline-flex; align-items: center; gap: 0.45rem; }
+  .legend .sw {
+    width: 16px; height: 16px; border: 1px solid var(--rule); display: inline-block;
+  }
+
+  /* ====== find_slot animation ====== */
+  .findslot-strip {
+    display: grid; gap: 3px; grid-auto-flow: column;
+    grid-template-columns: repeat(12, 1fr); font-family: var(--mono); font-size: 11px;
+  }
+  .findslot-strip .pcell { aspect-ratio: 1.1; }
+
+  /* ====== state table ====== */
+  table.state {
+    width: 100%; border-collapse: collapse; margin: 1rem 0;
+    font-family: var(--mono); font-size: 12px;
+  }
+  table.state th, table.state td {
+    padding: 0.4rem 0.6rem; text-align: left;
+    border-bottom: 1px solid var(--rule);
+  }
+  table.state th {
+    font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent); font-weight: 600; border-bottom: 1px solid var(--ink);
+  }
+  table.state td.num { text-align: right; color: var(--ink); }
+  table.state tr.dim td { color: var(--mute); }
+  table.state td.live { color: var(--accent); font-weight: 600; }
+
+  .formula {
+    font-family: var(--mono); font-size: 14px;
+    text-align: center; padding: 1.25rem 1rem;
+    background: var(--paper-2); border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    margin: 1rem 0;
+  }
+  .formula .var { color: var(--accent); font-weight: 600; }
+  .formula .op  { color: var(--ink-soft); }
+
+  @keyframes fadeUp { from{opacity:0;transform:translateY(8px);} to{opacity:1;transform:translateY(0);} }
+  .fade-up { animation: fadeUp 600ms cubic-bezier(.22,1,.36,1) both; }
+  .fade-up.d1{animation-delay:80ms;} .fade-up.d2{animation-delay:160ms;}
+  .fade-up.d3{animation-delay:240ms;} .fade-up.d4{animation-delay:320ms;}
+
+  @media (max-width: 960px) {
+    :root { --main-col: 1fr; --margin-col: 0; --gutter: 0; }
+    .page { grid-template-columns: 1fr; padding: 2rem 1.25rem 4rem; }
+    .page > aside.margin {
+      grid-column: 1; border-top: none;
+      border-left: 3px solid var(--accent);
+      padding: 0.6rem 0.9rem; margin: 1.5rem 0;
+      background: var(--paper-2);
+    }
+    h2::before { position: static; display: block; margin-bottom: 0.3rem; }
+    .chapter-head { grid-template-columns: 1fr; }
+    .chapter-meta { text-align: left; }
+    .plane-row { grid-template-columns: 5rem 1fr; }
+    body { font-size: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="running-head">
+  <div class="inner">
+    <span class="title">The Recurrent Cache</span>
+    <span class="folio">llama-memory-recurrent · src/llama-memory-recurrent.{h,cpp}</span>
+  </div>
+</div>
+
+<article class="page">
+
+  <header class="chapter-head fade-up">
+    <div class="chapter-number">R.</div>
+    <div class="chapter-meta">
+      <div class="kicker">A short engineering monograph</div>
+      <div>State machines, not transcripts</div>
+    </div>
+    <h1 class="chapter-title">The Recurrent Cache &amp; Slot Rollback</h1>
+    <p class="chapter-subtitle">A different kind of cache — one slot per sequence, not one per token — and a small accommodation for speculative decoding that lets it walk backwards through time.</p>
+  </header>
+
+  <p class="lede fade-up d1">
+    The KV cache is a transcript. The recurrent cache is a state machine. They share a class hierarchy
+    and very little else — and the differences are easiest to see once you stop pretending they're alike.
+  </p>
+
+  <p class="dropcap">In an attention-based transformer, the cache grows with the sequence: every token leaves a K and a V behind, and the next token reads all of them. In a state-space model — Mamba, RWKV, Qwen3.5 — the cache does not grow. Each layer keeps a single fixed-size <em>state</em> per sequence, updated in place as tokens stream through. The cache, in this regime, is not a transcript but a folded summary: a small dense object that <em>is</em> the sequence's past.</p>
+
+  <p>That changes almost everything about how the cache is bookkept. Cells are no longer per-token; they are per-sequence. <code>find_slot</code> does not look for a run of free positions; it looks for one slot to host an entire sequence's tail. Sequence sharing is no longer the cheap operation it was in the unified KV cache — there is no shared K/V to point at, only an opaque state vector that must be copied if a fork happens. And the most interesting addition, the one this page is mostly about, is the <em>rollback plane</em>: a small ring of snapshots that lets the cache un-do the last few state updates without recomputing from scratch.</p>
+
+  <aside class="margin">
+    <span class="ref">scope</span>
+    Everything here is in <code>src/llama-memory-recurrent.{h,cpp}</code>. The hybrid variants (<code>llama-memory-hybrid*</code>) wrap this class together with a unified KV cache for models that interleave attention and recurrence; the bookkeeping below is the recurrent half.
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ R.1">A cell is a sequence's home</h2>
+
+  <p>Forget what a cell meant in the unified KV cache. There, a cell was a per-token slot, and a sequence spread itself across many of them. Here a cell <em>is</em> a sequence — or, more precisely, a cell holds the current recurrent state for at least one sequence at one logical position. The metadata is small:</p>
+
+  <pre><span class="lbl">llama-memory-recurrent.h — line 88</span><span class="kw">struct</span> <span class="typ">mem_cell</span> {
+    <span class="typ">llama_pos</span> pos  = -1;   <span class="cmt">// last position this state corresponds to</span>
+    <span class="typ">int32_t</span>  src  = -1;   <span class="cmt">// physical row to copy from on the next compute</span>
+    <span class="typ">int32_t</span>  src0 = -1;   <span class="cmt">// staged src for the current ubatch</span>
+    <span class="typ">int32_t</span>  tail = -1;   <span class="cmt">// when this cell IS a seq_id slot, the cell that owns its tail</span>
+
+    std::set&lt;<span class="typ">llama_seq_id</span>&gt; seq_id;  <span class="cmt">// who lives in this cell right now</span>
+};</pre>
+
+  <p>Two fields earn their keep early. <code>pos</code> is the position of the <em>last</em> token folded into the state — not the position of a single token, but the rightmost position seen. <code>tail</code> is the indirection that lets a sequence-id be looked up in O(1): cell <em>i</em>, when <code>i</code> is also a valid <code>seq_id</code>, can be asked &ldquo;where does sequence <em>i</em>'s state currently live?&rdquo; — the answer is in its <code>tail</code>. So a <code>seq_id</code> and a cell index share a number space, but the actual state for sequence <em>i</em> usually lives somewhere else, at <code>cells[cells[i].tail]</code>.</p>
+
+  <p>This indirection is doing a small amount of clever work. It means a sequence's state can be physically moved around the cache (to make room, to gather a contiguous batch, to swap with another seq) without rewriting every reference to it; the consumer always finds the state through <code>tail</code>. We will see this matter in §R.3, when the allocator gathers a ubatch.</p>
+
+  <aside class="margin">
+    <span class="ref">§ R.1 — tail vs. cell</span>
+    A seq_id <em>n</em> uses cell <em>n</em> as a name-tag, not a state container. The state lives at <code>cells[cells[n].tail]</code>. If you find that confusing — you're not alone; the variable name is doing double duty.
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ R.2">The tensor is wider than the cache</h2>
+
+  <p>Here is where it stops looking like a normal cache. The <code>cells</code> array has <code>mem_size</code> entries — typically equal to <code>n_seq_max</code>, the number of concurrent sequences. But the on-device R and S tensors are taller than that:</p>
+
+  <pre><span class="lbl">llama-memory-recurrent.cpp — line 99</span><span class="kw">const</span> <span class="typ">uint32_t</span> n_rows = mem_size <span class="op">*</span> (<span class="num">1</span> <span class="op">+</span> n_rs_seq);
+ggml_tensor <span class="op">*</span> r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+ggml_tensor <span class="op">*</span> s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);</pre>
+
+  <p>The metadata grid has <code>mem_size</code> rows; the storage tensor has <code>mem_size · (1 + n_rs_seq)</code>. That extra dimension is a stack of <em>snapshot planes</em>. Plane 0 is the live state — the one the cells point at and the one the next forward pass will update. Plane 1 is yesterday's state, plane 2 is the day before, and so on, up to <code>n_rs_seq</code> snapshots deep.</p>
+
+  <figure class="full">
+    <div class="diagram-frame">
+      <svg viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+        <text class="dg-title" x="20" y="26">R / S storage tensor — <tspan font-style="normal">size × (1 + n_rs_seq)</tspan></text>
+        <text class="dg-label" x="20" y="44">cells[] grid is one plane; storage stacks (1 + n_rs_seq) planes</text>
+
+        <!-- planes -->
+        <g transform="translate(40, 70)">
+          <!-- plane 3 (oldest) -->
+          <g transform="translate(40, 0)">
+            <rect x="0" y="0" width="640" height="40" class="dg-fill-soft" opacity="0.55"/>
+            <line x1="80"  y1="0" x2="80"  y2="40" class="dg-stroke-soft"/>
+            <line x1="160" y1="0" x2="160" y2="40" class="dg-stroke-soft"/>
+            <line x1="240" y1="0" x2="240" y2="40" class="dg-stroke-soft"/>
+            <line x1="320" y1="0" x2="320" y2="40" class="dg-stroke-soft"/>
+            <line x1="400" y1="0" x2="400" y2="40" class="dg-stroke-soft"/>
+            <line x1="480" y1="0" x2="480" y2="40" class="dg-stroke-soft"/>
+            <line x1="560" y1="0" x2="560" y2="40" class="dg-stroke-soft"/>
+            <text class="dg-label" x="-30" y="25">snapshot 3</text>
+          </g>
+          <!-- plane 2 -->
+          <g transform="translate(30, 50)">
+            <rect x="0" y="0" width="640" height="40" class="dg-fill-soft" opacity="0.7"/>
+            <line x1="80"  y1="0" x2="80"  y2="40" class="dg-stroke-soft"/>
+            <line x1="160" y1="0" x2="160" y2="40" class="dg-stroke-soft"/>
+            <line x1="240" y1="0" x2="240" y2="40" class="dg-stroke-soft"/>
+            <line x1="320" y1="0" x2="320" y2="40" class="dg-stroke-soft"/>
+            <line x1="400" y1="0" x2="400" y2="40" class="dg-stroke-soft"/>
+            <line x1="480" y1="0" x2="480" y2="40" class="dg-stroke-soft"/>
+            <line x1="560" y1="0" x2="560" y2="40" class="dg-stroke-soft"/>
+            <text class="dg-label" x="-30" y="25">snapshot 2</text>
+          </g>
+          <!-- plane 1 -->
+          <g transform="translate(20, 100)">
+            <rect x="0" y="0" width="640" height="40" class="dg-fill-soft" opacity="0.85"/>
+            <line x1="80"  y1="0" x2="80"  y2="40" class="dg-stroke-soft"/>
+            <line x1="160" y1="0" x2="160" y2="40" class="dg-stroke-soft"/>
+            <line x1="240" y1="0" x2="240" y2="40" class="dg-stroke-soft"/>
+            <line x1="320" y1="0" x2="320" y2="40" class="dg-stroke-soft"/>
+            <line x1="400" y1="0" x2="400" y2="40" class="dg-stroke-soft"/>
+            <line x1="480" y1="0" x2="480" y2="40" class="dg-stroke-soft"/>
+            <line x1="560" y1="0" x2="560" y2="40" class="dg-stroke-soft"/>
+            <text class="dg-label" x="-30" y="25">snapshot 1</text>
+          </g>
+          <!-- plane 0 (live) -->
+          <g transform="translate(10, 150)">
+            <rect x="0" y="0" width="640" height="46" fill="#d8c8a0" stroke="#1a1715" stroke-width="1.2"/>
+            <line x1="80"  y1="0" x2="80"  y2="46" stroke="#1a1715" stroke-opacity="0.4"/>
+            <line x1="160" y1="0" x2="160" y2="46" stroke="#1a1715" stroke-opacity="0.4"/>
+            <line x1="240" y1="0" x2="240" y2="46" stroke="#1a1715" stroke-opacity="0.4"/>
+            <line x1="320" y1="0" x2="320" y2="46" stroke="#1a1715" stroke-opacity="0.4"/>
+            <line x1="400" y1="0" x2="400" y2="46" stroke="#1a1715" stroke-opacity="0.4"/>
+            <line x1="480" y1="0" x2="480" y2="46" stroke="#1a1715" stroke-opacity="0.4"/>
+            <line x1="560" y1="0" x2="560" y2="46" stroke="#1a1715" stroke-opacity="0.4"/>
+            <text class="dg-label" x="-30" y="28" fill="#b73a26">plane 0 · live</text>
+            <text class="dg-text" x="20"  y="29">slot 0</text>
+            <text class="dg-text" x="100" y="29">slot 1</text>
+            <text class="dg-text" x="180" y="29">slot 2</text>
+            <text class="dg-text" x="260" y="29">slot 3</text>
+            <text class="dg-text" x="340" y="29">slot 4</text>
+            <text class="dg-text" x="420" y="29">slot 5</text>
+            <text class="dg-text" x="500" y="29">slot 6</text>
+            <text class="dg-text" x="580" y="29">slot 7</text>
+          </g>
+          <!-- arrow back -->
+          <g transform="translate(700, 80)">
+            <line x1="0" y1="115" x2="0" y2="-5" class="dg-accent"/>
+            <polygon points="0,-12 -4,-2 4,-2" fill="#b73a26"/>
+            <text class="dg-label" x="-40" y="60" fill="#b73a26" transform="rotate(90, 8, 60)">rollback into past</text>
+          </g>
+          <!-- one shared seq's lineage -->
+          <line x1="60"  y1="0"   x2="60"  y2="155" class="dg-stroke dg-dashed" opacity="0.5"/>
+        </g>
+        <text class="dg-label" x="20" y="300">a single physical address in plane <tspan fill="#b73a26">k</tspan> is at logical row <tspan fill="#b73a26">k · mem_size + slot</tspan></text>
+      </svg>
+    </div>
+    <figcaption>
+      <span class="fig-num">Fig. R.1</span>
+      <span class="fig-desc">Storage is widened in the row dimension; the cells array indexes only the live plane.</span>
+    </figcaption>
+  </figure>
+
+  <p>A snapshot is not maintained explicitly. The state-update kernel writes the new state of slot <em>s</em> at row <em>s</em> of plane 0 — but the device-side update routine reads from the source row at <code>cells[s].src0</code>, which can point either at the live plane or, when the caller has armed a rollback, at one of the upper planes. We will spell out that addressing in §R.6. The shape of the storage tensor is the static commitment that makes the rollback possible at runtime.</p>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ R.3">find_slot does not look for runs</h2>
+
+  <p>The allocator's job in the unified KV cache is to scan for a contiguous run of empty cells big enough to hold the next ubatch. Here, the job is gentler: one cell per sequence in the ubatch, and the contiguous-run requirement is enforced by <em>moving</em> cells around, not by waiting until the cache has fragments aligned. <code>find_slot</code> in this file is in three phases:</p>
+
+  <ul class="dashes">
+    <li><strong>Claim.</strong> For each sequence in the ubatch, locate its current tail. If the seq does not own a cell yet, claim the next empty cell as its tail.</li>
+    <li><strong>Gather.</strong> Swap whatever cells the seqs landed in so they end up at consecutive indices <code>min .. min + n_seqs − 1</code>. The data does not move; only the metadata is rearranged, and the indirection through <code>tail</code> stays consistent.</li>
+    <li><strong>Stage src0 and the zero source.</strong> For each cell in the run, write <code>src0</code> — the row the device should copy <em>from</em> on the next compute pass — and pick a free row to use as the zero state for new sequences.</li>
+  </ul>
+
+  <p>The third step is where the rollback offset is folded in, but we'll get to that. First, watch the gather happen.</p>
+
+  <div class="full">
+    <div class="diagram-frame">
+      <div style="font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--ink-soft); margin-bottom:.65rem;">
+        find_slot &mdash; gather two sequences into a contiguous run
+      </div>
+      <div class="findslot-strip" id="fs-strip"></div>
+      <div class="controls">
+        <button id="fs-reset">Reset</button>
+        <button id="fs-step" class="primary">Step ▶</button>
+        <div class="status" id="fs-status">Click <em>Step</em> to advance.</div>
+      </div>
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:#d8c8a0"></span> seq 0</span>
+        <span class="item"><span class="sw" style="background:#b8c8a0"></span> seq 1</span>
+        <span class="item"><span class="sw" style="background:var(--paper)"></span> empty</span>
+        <span class="item"><span class="sw" style="background:transparent;outline:2px solid var(--accent);outline-offset:-2px"></span> staged in this ubatch</span>
+      </div>
+    </div>
+  </div>
+
+  <p style="margin-top:0.5rem;">Notice that no data was assumed to move; only the metadata swapped. In the real implementation, the row addresses in the storage tensor follow the metadata through one extra indirection — <code>cells[i].src0</code> — and the swap rewires those indices so the device-side copy still reads from the correct row of plane 0.</p>
+
+  <aside class="margin">
+    <span class="ref">§ R.3 — gather</span>
+    The gather is what lets <code>find_slot</code> return a single <code>(head, n)</code> pair instead of a list of scattered indices. Everything downstream — the input set-up, the build_rs graph — assumes the active cells are at <code>cells[head .. head + n)</code>.
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ R.4">Rollback, the short version</h2>
+
+  <p>Speculative decoding draws a fixed batch of draft tokens, runs them through the main model in one ubatch, and then verifies how many of them were accepted. The accepted tokens are committed; the rest must be unwound. For an attention cache, unwinding is a pair of erasures: <code>seq_rm</code> on the unaccepted positions, done. The K and V at those positions are stale but harmless — they will be overwritten when new tokens take their place.</p>
+
+  <p>For a recurrent cache, there is nothing to erase. The state at position <em>n</em> already <em>contains</em> the state at position <em>n − 1</em>; the model folded the latter into the former. To go back to position <em>n − 1</em>, you have to recover the state from before the last fold. That state isn't kept by default — but with <code>n_rs_seq &gt; 0</code> it is, in one of the snapshot planes.</p>
+
+  <pre><span class="lbl">llama-memory-recurrent.cpp — line 180</span><span class="cmt">// inside seq_rm — partial rollback path</span>
+<span class="kw">if</span> (<span class="num">0</span> &lt; p0 &amp;&amp; p0 &lt;= cell.pos &amp;&amp; p1 &gt; cell.pos) {
+    <span class="kw">const</span> <span class="typ">llama_pos</span> rollback = cell.pos <span class="op">-</span> (p0 <span class="op">-</span> <span class="num">1</span>);
+    <span class="kw">if</span> (rollback &gt;= <span class="num">1</span> &amp;&amp; rollback &lt;= (<span class="typ">llama_pos</span>) n_rs_seq) {
+        <span class="fn">set_rs_idx</span>(seq_id, (<span class="typ">uint32_t</span>) rollback);
+        cell.pos = p0 <span class="op">-</span> <span class="num">1</span>;
+        <span class="kw">return</span> <span class="kw">true</span>;
+    }
+    <span class="kw">return</span> <span class="kw">false</span>;
+}</pre>
+
+  <p>Three things in twelve lines. <em>One:</em> if the caller asks to delete the suffix from <code>p0</code> to <code>p1</code> and the cell's last position is somewhere in that suffix, this is a rollback request. <em>Two:</em> the depth of the rollback — how many tokens to unwind — must fit in the <code>n_rs_seq</code> window; otherwise the rollback is refused, and the caller will need to reseed the sequence from scratch. <em>Three:</em> on success, the cell's position is moved backward to <code>p0 − 1</code> (the last surviving token) and a per-seq <em>rollback index</em> is set so the next forward pass reads from the right snapshot plane.</p>
+
+  <p>The state is not copied anywhere. The snapshot plane <em>is</em> the rolled-back state; the metadata simply chooses which plane the next compute pass reads from. The expensive part of rollback — recovering the prior state — was already paid for by writing the snapshots in the first place.</p>
+
+  <!-- ============================================================ -->
+  <div class="full">
+    <div class="diagram-frame">
+      <div style="font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--ink-soft); margin-bottom:.65rem;">
+        Interactive · advance and roll back a sequence (n_rs_seq = 3)
+      </div>
+
+      <!-- token strip -->
+      <div style="font-family:var(--mono); font-size:11px; color:var(--ink-soft); letter-spacing:0.06em; margin-top:0.2rem;">
+        sequence 0 — committed tokens
+      </div>
+      <div class="seq-strip" id="rb-tokens"></div>
+
+      <!-- planes -->
+      <div class="planes" id="rb-planes" style="margin-top:1.3rem;"></div>
+
+      <!-- state -->
+      <table class="state" id="rb-state">
+        <thead>
+          <tr><th>seq_id</th><th>cells[seq].tail</th><th>cell.pos</th><th>rs_idx</th><th>reads from plane</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+
+      <div class="controls">
+        <button id="rb-advance" class="primary">advance(seq=0)</button>
+        <span class="input-pair">p0 = <input type="number" id="rb-p0" value="0" min="0" style="width:3rem"></span>
+        <button id="rb-rollback">seq_rm(seq=0, p0, ∞)</button>
+        <button id="rb-reset">Reset</button>
+        <div class="status" id="rb-status">cache is empty</div>
+      </div>
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:#d8c8a0"></span> seq 0 cell</span>
+        <span class="item"><span class="sw" style="background:transparent;outline:2px solid var(--accent);outline-offset:-2px"></span> plane the next compute will read</span>
+        <span class="item"><span class="sw" style="background:transparent;outline:2px dashed var(--accent-2);outline-offset:-2px"></span> stale snapshot</span>
+        <span class="item"><span class="sw" style="background:var(--paper)"></span> never written</span>
+      </div>
+    </div>
+  </div>
+
+  <aside class="margin">
+    <span class="ref">§ R.4 — try it</span>
+    Click <em>advance</em> a few times to fold tokens into the state. Then set p0 below the current position and click <em>seq_rm</em>. A rollback of depth ≤ 3 is honoured by switching the plane; a deeper rollback fails and you must reseed.
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ R.5">Who pays for the snapshots</h2>
+
+  <p>The snapshots are not free. The R and S storage tensors are <code>(1 + n_rs_seq)×</code> larger; for Qwen3.5, the only arch in this tree that currently advertises rollback support, that is roughly the difference between a 60 MiB recurrent cache and a 240 MiB one at <code>n_rs_seq = 3</code>. Two consequences follow.</p>
+
+  <p>First, the planes have to be <em>maintained</em> by the model graph — when the state machine folds a new token in, it has to scroll the previous live state into snapshot 1, snapshot 1 into snapshot 2, and so on, dropping the oldest. This is not done by the cache; it is done by the model's recurrent step graph, which sees the wider storage and writes the appropriate rows. The cache is only responsible for telling the graph <em>where</em> to read and <em>where</em> to write — the addresses in <code>src0</code>, plus the rollback index.</p>
+
+  <p>Second, the rollback is per-sequence, not per-cell. A single ubatch that mixes a rolled-back sequence and a non-rolled one is fine: the rollback index is keyed by <code>seq_id</code> and applied when the cache emits the source row for that sequence in <code>s_copy</code>. We will look at that formula next.</p>
+
+  <aside class="margin">
+    <span class="ref">arch gating</span>
+    <code>llama-context.cpp</code> clamps <code>n_rs_seq</code> to 0 unless the model is one of the architectures returning true from <code>llm_arch_supports_rs_rollback</code> — currently Qwen3.5 and Qwen3.5-MoE. The rest of the recurrent zoo (Mamba, RWKV, Plamo2, …) gets a normal single-plane cache.
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ R.6">The s_copy formula</h2>
+
+  <p>Every compute step starts with the cache filling a tiny host-side tensor named <code>s_copy</code>, one entry per cell in the ubatch. Each entry is the physical row from which the device-side recurrent kernel should copy its starting state. With no rollback, the row is simply the cell's <code>src0</code> in plane 0. With rollback, the cell's seq picks a plane:</p>
+
+  <div class="formula full">
+    <span class="op">return</span>&nbsp; <span class="var">rs_idx[seq]</span> <span class="op">×</span> <span class="var">size</span> <span class="op">+</span> <span class="var">src0</span><span class="op">;</span>
+    &nbsp;&nbsp;<span class="op">// then reset</span> <span class="var">rs_idx[seq] = 0;</span>
+  </div>
+
+  <p>Read this carefully. <code>src0</code> is a slot index, 0 ≤ <code>src0</code> &lt; <code>size</code>. <code>rs_idx[seq]</code> is the chosen snapshot plane (0 for live, ≥ 1 for the past). The product walks <code>rs_idx</code> planes up the tensor, then adds the slot offset — a flattened 2D index into a flat row major tensor.</p>
+
+  <p>After the read, <code>rs_idx[seq]</code> is reset to zero. That is the subtle invariant: rollback is a one-shot stake. Once the kernel has read from snapshot plane <em>k</em>, the next compute will write the new state to plane 0 again. If you wanted to roll back the same sequence further, you would have to do it again on the next batch — but you wouldn't, because the previous rollback already consumed a snapshot, and there is nothing to roll back to.</p>
+
+  <pre><span class="lbl">llama-memory-recurrent.cpp — line 1244</span><span class="typ">int32_t</span> llama_memory_recurrent_context<span class="op">::</span><span class="fn">s_copy</span>(<span class="kw">int</span> i) <span class="kw">const</span> {
+    <span class="kw">const</span> <span class="typ">uint32_t</span> cell_idx = i <span class="op">+</span> mem-&gt;head;
+    <span class="kw">const</span> <span class="typ">int32_t</span>  src0     = mem-&gt;cells[cell_idx].src0;
+
+    <span class="kw">if</span> (mem-&gt;n_rs_seq == <span class="num">0</span>) { <span class="kw">return</span> src0; }
+
+    <span class="typ">uint32_t</span> idx = <span class="num">0</span>;
+    <span class="kw">if</span> (!mem-&gt;cells[cell_idx].seq_id.empty()) {
+        <span class="kw">const</span> <span class="typ">llama_seq_id</span> seq = <span class="op">*</span>mem-&gt;cells[cell_idx].seq_id.begin();
+        <span class="kw">if</span> (seq &gt;= <span class="num">0</span> &amp;&amp; (<span class="typ">size_t</span>) seq &lt; mem-&gt;rs_idx.size()) {
+            idx = mem-&gt;rs_idx[seq];
+            mem-&gt;rs_idx[seq] = <span class="num">0</span>;   <span class="cmt">// one-shot</span>
+        }
+    }
+    <span class="kw">return</span> (<span class="typ">int32_t</span>)(idx <span class="op">*</span> mem-&gt;size) <span class="op">+</span> src0;
+}</pre>
+
+  <div class="callout">
+    <span class="label">Invariant</span>
+    <p>A snapshot is a read-only state for exactly one upcoming compute. The cache trusts the model graph to maintain the snapshot stack after each accepted step. There is no reference counting on the planes; if rollback is requested but the snapshot wasn't kept, the kernel reads stale or corrupt state.</p>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ R.7">The zero plane (rs_z)</h2>
+
+  <p>One more wrinkle. A new sequence has no prior state. When <code>find_slot</code> lays out the ubatch, it scans the active cells looking for one whose <code>src</code> is unset — never been written, no prior reference — and tags it as <code>rs_z</code>. The model's recurrent step uses this row as its zero source: any cell in the ubatch whose <code>src &lt; 0</code> (a new sequence) copies <em>from</em> <code>rs_z</code>, which the backend has guaranteed to be all zeros. It is not really a separate plane; it is a slot in plane 0 that happens to hold the canonical zero state for the duration of this batch.</p>
+
+  <p>If you wonder why this is needed instead of just emitting a <code>src0 = -1</code> sentinel and letting the kernel branch: state-space kernels are unrolled across the whole batch, and a branch-free copy from a known-zero address is faster than a per-cell predicate. The cost of holding one slot's worth of zero on the device is negligible compared to the kernel saved by the assumption.</p>
+
+  <aside class="margin">
+    <span class="ref">§ R.7 — zero plane</span>
+    <code>rs_z = -1</code> when the entire active run already has prior states; <code>find_slot</code> still constructs it, but no cell needs it. It is asserted non-negative only when at least one cell asks for the zero source.
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ R.8">Why splits become sequential</h2>
+
+  <p>Tucked away in <code>init_batch</code>, with a TAG comment, is a small but consequential restriction. When <code>n_rs_seq &gt; 0</code> the batch is split by sequence rather than equally:</p>
+
+  <pre><span class="lbl">llama-memory-recurrent.cpp — line 419</span><span class="kw">if</span> (n_rs_seq &gt; <span class="num">0</span>) {
+    <span class="cmt">// [TAG_RECURRENT_ROLLBACK_SPLITS]</span>
+    <span class="cmt">// TODO: recurrent state rollback does not support equal splits</span>
+    ubatch = balloc.<span class="fn">split_seq</span>(n_ubatch);
+} <span class="kw">else</span> {
+    ubatch = balloc.<span class="fn">split_equal</span>(n_ubatch, <span class="kw">true</span>);
+}</pre>
+
+  <p>The reason is a property of the snapshot stack. An equal split groups tokens by position across many sequences and feeds them in lock-step; that would require the snapshot plane for sequence A and the live plane for sequence B in the same kernel invocation, indexed independently per-row. The current state-update kernels assume a single rollback index per kernel launch — applied uniformly, after the metadata gather has placed all the active cells at <code>head .. head + n</code>. Sequential splits route each sequence's tokens through their own kernel pass, which is where the per-seq rollback index can be applied cleanly.</p>
+
+  <p>This is a trade-off the implementation made on purpose. Equal splits would extract more parallelism from large batches; sequential splits make the rollback path tractable. For the speculative-decoding workload that motivated rollback — a handful of sequences with short drafts — sequential is the right default.</p>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ R.9">State save / load with a pending rollback</h2>
+
+  <p>Two final places the planes show up: the serialization paths. When <code>state_write</code> exports a sequence with a pending rollback, the row it streams out is not the live plane's row; it is the snapshot plane's row corresponding to the current <code>rs_idx[seq]</code>. The formula is the same:</p>
+
+  <pre><span class="lbl">llama-memory-recurrent.cpp — line 772</span><span class="kw">const</span> <span class="typ">uint32_t</span> cell_id = rs_idx_cur <span class="op">*</span> size <span class="op">+</span> (cell.src &gt;= <span class="num">0</span> ? cell.src : (<span class="typ">int32_t</span>) i);</pre>
+
+  <p>The logical state for sequence <em>s</em> at the time of the save <em>is</em> the snapshot. If you saved the live plane, you would be saving the state from before the rollback was applied — which the rollback was specifically meant to abandon. So the writer reaches into the chosen plane and exports those rows instead, and the reader, on load, drops the rs_idx back to zero: the loaded plane <em>is</em> the new live state, with no rollback history.</p>
+
+  <aside class="margin">
+    <span class="ref">§ R.9 — shared seqs</span>
+    A constraint hides here: if a cell is shared between multiple sequences with different rollback indices, the writer aborts with <code>cannot write shared recurrent state with different rollback indices</code>. The serialization format cannot express "this row is two different states depending on who is reading it."
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ R.10">A summary</h2>
+
+  <p>The recurrent cache is a small, opinionated allocator over a state vector. Most of its bookkeeping is unsurprising — one slot per sequence, a tail indirection for fast lookup, a gather step to keep ubatches contiguous. The rollback machinery is the addition that distinguishes it: a stack of snapshot planes, sized at construction, addressed by a per-sequence index, with a one-shot read semantics that aligns with the way the model graph maintains the stack. The whole apparatus is justified by exactly one workload — speculative decoding against a state-space model — and the design choices reflect that focus: per-seq, not per-cell; sequential splits, not equal; gated by architecture, not on by default. It is a useful illustration of how a cache earns its complexity only when there is an existing user that needs precisely that complexity, and not before.</p>
+
+  <p>If you want to compare it against the attention-based cache, the contrast is clean: the unified KV cache earns its bookkeeping by storing many tokens and reusing prefixes; the recurrent cache earns its bookkeeping by storing one summary and being able to step that summary backward. Different operations, different invariants, the same class hierarchy, and a remarkable amount of shared scaffolding in <code>llama-memory.h</code> binding them together.</p>
+
+</article>
+
+<script>
+// =============================================================
+// FIND_SLOT GATHER ANIMATION
+// =============================================================
+(function () {
+  const strip = document.getElementById('fs-strip');
+  const status = document.getElementById('fs-status');
+  const stepBtn = document.getElementById('fs-step');
+  const resetBtn = document.getElementById('fs-reset');
+  const N = 12;
+  let state, step;
+
+  const initial = () => ({
+    // 12 cells; some occupied
+    // seq 0 lives at cell idx 5, seq 1 at cell idx 9
+    cells: Array.from({length: N}, (_, i) => {
+      if (i === 5) return {sid: 0, pos: 12};
+      if (i === 9) return {sid: 1, pos: 7};
+      return null;
+    }),
+    tail: {0: 5, 1: 9},
+    head: -1, n: 0,
+    staged: []  // cell indices that are in the active run
+  });
+
+  const render = () => {
+    strip.innerHTML = '';
+    for (let i = 0; i < N; i++) {
+      const c = state.cells[i];
+      const div = document.createElement('div');
+      let cls = 'pcell ';
+      cls += c ? `s${c.sid}` : 'empty';
+      if (state.staged.includes(i)) cls += ' current';
+      div.className = cls;
+      if (c) {
+        div.innerHTML = `<span class="pos">${c.pos}</span><span class="lbl">s${c.sid} · cell ${i}</span>`;
+      } else {
+        div.innerHTML = `<span class="pos">·</span><span class="lbl">cell ${i}</span>`;
+      }
+      strip.appendChild(div);
+    }
+  };
+
+  const steps = [
+    {
+      msg: 'Initial state — seq 0 lives at cell 5, seq 1 at cell 9. Ubatch wants both.',
+      apply: () => {}
+    },
+    {
+      msg: 'Claim: both seqs already own cells. Find the leftmost (min = 5) and rightmost (max = 9).',
+      apply: () => {
+        state.staged = [5, 9];
+      }
+    },
+    {
+      msg: 'Gather: swap cell 9 into the slot adjacent to cell 5 (which is cell 6). Only metadata moves.',
+      apply: () => {
+        const tmp = state.cells[6];
+        state.cells[6] = state.cells[9];
+        state.cells[9] = tmp;
+        state.tail[1] = 6;
+        state.staged = [5, 6];
+      }
+    },
+    {
+      msg: 'Done. head = 5, n = 2. The active run is contiguous; src0 is wired so the device reads the right rows.',
+      apply: () => {
+        state.head = 5; state.n = 2;
+      }
+    }
+  ];
+
+  const reset = () => {
+    state = initial();
+    step = 0;
+    render();
+    status.innerHTML = steps[0].msg;
+    stepBtn.disabled = false;
+  };
+
+  stepBtn.addEventListener('click', () => {
+    step += 1;
+    if (step >= steps.length) { stepBtn.disabled = true; return; }
+    steps[step].apply();
+    render();
+    status.innerHTML = steps[step].msg;
+    if (step === steps.length - 1) stepBtn.disabled = true;
+  });
+
+  resetBtn.addEventListener('click', reset);
+  reset();
+})();
+
+// =============================================================
+// ROLLBACK DEMO
+// =============================================================
+(function () {
+  const N_RS_SEQ = 3;  // 1 + 3 = 4 planes total
+  const MEM_SIZE = 4;
+  const SEQ = 0;
+  const SLOT = 0;  // seq 0 lives at slot 0 for this demo
+
+  const tokensEl = document.getElementById('rb-tokens');
+  const planesEl = document.getElementById('rb-planes');
+  const stateEl  = document.getElementById('rb-state').querySelector('tbody');
+  const status   = document.getElementById('rb-status');
+
+  // The conceptual "state" at position p is just labelled "p"; we render its
+  // position in the cell. Planes are the snapshot ring; plane 0 is live.
+  // Storage is conceptually a (1 + N_RS_SEQ) x MEM_SIZE grid of cell-states.
+
+  let planes;  // 2D: plane index -> array of MEM_SIZE entries ({pos} or null)
+  let cellPos;       // logical pos of the SEQ's cell (mem_cell.pos)
+  let rsIdx;         // rs_idx[SEQ]
+  let tokensCommitted; // count of tokens ever folded in
+  let lastRollback;  // for token strip rendering: index where rollback chopped off
+
+  function init() {
+    planes = Array.from({length: 1 + N_RS_SEQ}, () => Array(MEM_SIZE).fill(null));
+    cellPos = -1;
+    rsIdx = 0;
+    tokensCommitted = 0;
+    lastRollback = -1;
+    render();
+    status.textContent = 'cache is empty';
+  }
+
+  // simulate the "advance" step:
+  //   the model graph reads from plane[rs_idx], shifts old planes down,
+  //   writes the new state into plane[0]. Then rs_idx resets.
+  function advance() {
+    // Determine the source plane based on rs_idx (one-shot)
+    const srcPlane = rsIdx;
+    const newPos = cellPos + 1;
+
+    // 1. scroll the snapshots: plane k <- plane k-1, for k = N_RS_SEQ .. 1
+    for (let k = N_RS_SEQ; k >= 1; k--) {
+      planes[k][SLOT] = planes[k - 1][SLOT];
+    }
+    // 2. plane 0 gets the new state (folded from srcPlane)
+    planes[0][SLOT] = { pos: newPos };
+    // 3. metadata
+    cellPos = newPos;
+    rsIdx = 0;  // one-shot reset
+    tokensCommitted = Math.max(tokensCommitted, newPos + 1);
+    if (newPos + 1 > lastRollback + 1) {
+      // extend committed history past any previously dropped tokens
+    }
+    render();
+    if (srcPlane === 0) {
+      status.innerHTML = `advance() — folded token at pos ${newPos} into plane 0 (read from live).`;
+    } else {
+      status.innerHTML = `advance() — read from snapshot plane ${srcPlane}, wrote new state to plane 0. rs_idx → 0.`;
+    }
+  }
+
+  function rollback(p0) {
+    if (cellPos < 0) {
+      status.textContent = 'nothing to roll back — cache empty';
+      return;
+    }
+    if (p0 > cellPos) {
+      status.innerHTML = `seq_rm(p0=${p0}) — p0 > cell.pos (${cellPos}). nothing to do.`;
+      return;
+    }
+    if (p0 <= 0) {
+      status.innerHTML = `seq_rm(p0=${p0}) — full erase path; clears the cell and rs_idx.`;
+      cellPos = -1;
+      rsIdx = 0;
+      planes = Array.from({length: 1 + N_RS_SEQ}, () => Array(MEM_SIZE).fill(null));
+      lastRollback = -1;
+      render();
+      return;
+    }
+    const depth = cellPos - (p0 - 1);
+    if (depth < 1 || depth > N_RS_SEQ) {
+      status.innerHTML = `seq_rm(p0=${p0}) — rollback depth ${depth} exceeds n_rs_seq=${N_RS_SEQ}. <strong>refused</strong>; caller must reseed.`;
+      return;
+    }
+    rsIdx = depth;
+    cellPos = p0 - 1;
+    lastRollback = cellPos;
+    render();
+    status.innerHTML = `seq_rm(p0=${p0}) — depth ${depth} ≤ n_rs_seq. cell.pos ← ${p0 - 1}, rs_idx ← ${depth}. next compute reads from plane ${depth}.`;
+  }
+
+  function render() {
+    // tokens strip
+    tokensEl.innerHTML = '';
+    const showN = Math.max(tokensCommitted, cellPos + 1);
+    for (let i = 0; i < showN; i++) {
+      const t = document.createElement('div');
+      let cls = 'tok';
+      if (i <= cellPos) cls += ' active';
+      else cls += ' dropped';
+      t.className = cls;
+      t.textContent = i;
+      tokensEl.appendChild(t);
+    }
+    if (showN === 0) {
+      const t = document.createElement('div');
+      t.style.fontFamily = 'var(--mono)';
+      t.style.fontSize = '11px';
+      t.style.color = 'var(--mute)';
+      t.textContent = '(none yet — click advance)';
+      tokensEl.appendChild(t);
+    }
+
+    // planes
+    planesEl.innerHTML = '';
+    for (let p = 0; p < 1 + N_RS_SEQ; p++) {
+      const row = document.createElement('div');
+      row.className = 'plane-row';
+
+      const lbl = document.createElement('div');
+      let liveFlag = (p === rsIdx);
+      lbl.className = 'plane-label' + (p === 0 ? '' : ' snapshot') + (liveFlag ? ' live' : '');
+      lbl.innerHTML = `<div class="ttl">${p === 0 ? 'plane 0' : 'snapshot ' + p}</div>` +
+                      `<div>${p === 0 ? 'live' : 'rollback −' + p}</div>` +
+                      (liveFlag ? `<div style="margin-top:.3rem;color:var(--accent);font-weight:600;">↳ next read</div>` : '');
+      row.appendChild(lbl);
+
+      const cells = document.createElement('div');
+      cells.className = 'plane-cells';
+      // we use MEM_SIZE = 4 to leave a couple unused slots visible
+      cells.style.gridTemplateColumns = `repeat(${MEM_SIZE}, 1fr)`;
+      for (let s = 0; s < MEM_SIZE; s++) {
+        const c = document.createElement('div');
+        const data = planes[p][s];
+        let cls = 'pcell ' + (data ? 's0' : 'empty');
+        if (s !== SLOT) cls += ' faded';
+        if (s === SLOT && p === rsIdx && data) cls += ' current';
+        if (s === SLOT && p > 0 && p > rsIdx && data) cls += ' copy-src';
+        c.className = cls;
+        if (data) {
+          c.innerHTML = `<span class="pos">pos ${data.pos}</span><span class="lbl">slot ${s}</span>`;
+        } else {
+          c.innerHTML = `<span class="pos">·</span><span class="lbl">slot ${s}</span>`;
+        }
+        cells.appendChild(c);
+      }
+      row.appendChild(cells);
+      planesEl.appendChild(row);
+    }
+
+    // state table
+    stateEl.innerHTML = '';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>0</td><td class="num">${SLOT}</td><td class="num live">${cellPos}</td><td class="num">${rsIdx}</td><td class="num">${rsIdx}</td>`;
+    stateEl.appendChild(tr);
+  }
+
+  document.getElementById('rb-advance').addEventListener('click', advance);
+  document.getElementById('rb-rollback').addEventListener('click', () => {
+    const v = parseInt(document.getElementById('rb-p0').value, 10);
+    rollback(isFinite(v) ? v : 0);
+  });
+  document.getElementById('rb-reset').addEventListener('click', init);
+  init();
+})();
+</script>
+
+</body>
+</html>

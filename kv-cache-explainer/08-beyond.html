@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VIII · Quantization &amp; Beyond — The KV-Cache</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="running-head">
+  <div class="inner">
+    <span class="title">The KV-Cache</span>
+    <div class="nav">
+      <a href="index.html">Contents</a>
+      <a href="01-why-cache.html">I</a>
+      <a href="02-layout.html">II</a>
+      <a href="03-cells.html">III</a>
+      <a href="04-streams.html">IV</a>
+      <a href="05-iswa.html">V</a>
+      <a href="06-mask.html">VI</a>
+      <a href="07-operations.html">VII</a>
+      <a href="08-beyond.html" aria-current="page">VIII</a>
+    </div>
+    <span class="folio">08 / 08</span>
+  </div>
+</div>
+
+<article class="page">
+
+  <header class="chapter-head fade-up">
+    <div class="chapter-number">VIII.</div>
+    <div class="chapter-meta">
+      <div class="kicker">Chapter the Eighth</div>
+      <div>Frontiers</div>
+    </div>
+    <h1 class="chapter-title">Quantization &amp; Beyond</h1>
+    <p class="chapter-subtitle">Storing K and V in eight bits. Sharing the cache with multi-token-prediction heads. Hybrid memory for models that aren't just attention.</p>
+  </header>
+
+  <p class="lede fade-up d1">
+    A cache that fits in memory is a cache that gets used. Two extensions have
+    moved the cache toward that goal; a third has begun to ask whether the cache
+    is the only kind of memory worth having.
+  </p>
+
+  <p class="dropcap">The seven previous chapters described a cache of full-precision tensors, with metadata for one kind of model: a stack of attention layers, all producing K and V of similar shape. The cache supports more than that. This chapter rounds out the picture with three additions, each of which extends the cache without violating its core abstractions: quantized storage, multi-token-prediction support, and hybrid recurrent-attention memory.</p>
+
+  <h2 data-section="§ 8.1">Quantized KV</h2>
+
+  <p>We previewed this in <a href="02-layout.html">Chapter II</a>: the constructor accepts <code>type_k</code> and <code>type_v</code> independently, and any GGML quantization type can be specified. The two are not symmetric in practice.</p>
+
+  <p>K is the more forgiving target. The dot products <em>Q·Kᵀ</em> are normalised by <em>√d</em> and passed through a softmax, both of which absorb small numerical errors. Quantizing K to q8_0 is, in practice, lossless for most models; quantizing to q4_0 is noticeable but tolerable. V is the more demanding target — the post-softmax values are mixed with V vectors directly, and errors there propagate unmasked. q8_0 V is fine; q4_0 V tends to degrade quality more visibly. The typical configuration in serving deployments is q8_0 for both, with q4_0 K and q8_0 V as a more aggressive option.</p>
+
+  <table>
+    <thead>
+      <tr><th>Configuration</th><th>K bits/elt</th><th>V bits/elt</th><th>Relative size</th><th>Quality cost</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>fp16  / fp16</td>  <td>16</td><td>16</td><td>1.00×</td><td>baseline</td></tr>
+      <tr><td>q8_0  / q8_0</td>  <td>8.5</td><td>8.5</td><td>0.53×</td><td>negligible</td></tr>
+      <tr><td>q4_0  / q8_0</td>  <td>4.5</td><td>8.5</td><td>0.41×</td><td>small</td></tr>
+      <tr><td>q4_0  / q4_0</td>  <td>4.5</td><td>4.5</td><td>0.28×</td><td>model-dependent</td></tr>
+    </tbody>
+  </table>
+
+  <p>The implementation cost of all this is zero, in the sense that the cache code does not change between configurations. The tensor is allocated with the requested type, GGML's <code>ggml_mul_mat</code> handles the dequantization in its kernel, and the seq_* operations don't read the cells' bytes at all. From the cache's point of view, what's in those bytes is opaque — which is exactly the property that makes quantization a knob the user can turn rather than a feature that has to be implemented.</p>
+
+  <aside class="margin">
+    <span class="ref">§ 8.1 — note</span>
+    The defrag and stream-copy operations use <code>ggml_backend_tensor_copy</code>, which is layout-aware and dtype-aware. Copying a q8_0 slot to another q8_0 slot moves the quantized bytes directly, without dequantizing in between.
+  </aside>
+
+  <h2 data-section="§ 8.2">Multi-token prediction</h2>
+
+  <p>Gemma 4 introduces multi-token-prediction (MTP) heads: small additional decoder stacks that share the trunk model's hidden states up to some layer and then branch off to produce a draft prediction for the <em>next</em> token alongside the main model's prediction for the current one. The MTP heads run alongside the main forward pass; their drafts can be verified by the trunk on the following step, giving speculative-decoding-like speedups without a separate draft model.</p>
+
+  <p>From the cache's point of view, MTP heads pose a single question: do they need their own K and V buffers, or do they share the trunk's? The answer depends on the layer. For layers the head re-uses from the trunk, the K and V are shared — there is no separate cache. For layers the head introduces, the K and V are new and need to be stored somewhere. The cache supports this with a per-layer flag, <code>kv_only_nextn</code>, that tells the cache to allocate buffers only for the final <em>n</em> layers (those introduced by the MTP head).</p>
+
+  <pre><span class="lbl">src/llama-hparams.h — ~ line 95</span><span class="kw">struct</span> <span class="typ">llama_hparams</span> {
+    <span class="cmt">// when true, only the final n_layer_kv layers get K/V buffers.</span>
+    <span class="cmt">// the others reuse the trunk model's cache.</span>
+    <span class="kw">bool</span> kv_only_nextn = <span class="kw">false</span>;
+    <span class="typ">uint32_t</span> n_layer_kv = 0;
+    <span class="cmt">// ...</span>
+};</pre>
+
+  <p>The MTP head also wants to attach its own forward pass to the trunk's existing context — it shouldn't have to re-tokenize and re-cache the prefix. So the cache exposes <code>seq_pos_max(seq_id)</code> on its memory context: a way for the head to ask the trunk's cache "what's the highest cached position for this sequence?" and to anchor its draft predictions accordingly. The head's cache is small (only the layers it owns) but reads from the trunk's positions seamlessly.</p>
+
+  <h2 data-section="§ 8.3">Hybrid memory: not just attention</h2>
+
+  <p>Some modern architectures mix attention layers with recurrent layers — Mamba blocks, RWKV variants, or other state-space models. Recurrent layers do not have a KV cache; they have a small, fixed-size <em>recurrent state</em> that evolves with each token. The cache abstraction doesn't fit. The solution: a hybrid wrapper.</p>
+
+  <p><code>llama_memory_hybrid</code>, in <code>src/llama-memory-hybrid.{h,cpp}</code>, composes a <code>llama_kv_cache</code> for the attention layers with a recurrent-state buffer for the recurrent ones. Like the ISWA wrapper of <a href="05-iswa.html">Chapter V</a>, it implements the <code>llama_memory_i</code> interface and delegates to its children. Unlike the ISWA wrapper, its two children are different <em>kinds</em> of memory — a cache and a recurrent state — with different semantics. The seq_* operations dispatch to both, and the graph-building code routes each layer's query to the appropriate buffer.</p>
+
+  <figure class="full">
+    <div class="diagram-frame">
+      <svg viewBox="0 0 880 200" xmlns="http://www.w3.org/2000/svg">
+        <text class="dg-title" x="20" y="24">Hybrid memory · attention + recurrent</text>
+
+        <!-- model layers, alternating types -->
+        <g transform="translate(20, 50)">
+          <text class="dg-label" x="0" y="-6">layer stack</text>
+          <g>
+            <rect x="0" y="0" width="220" height="22" fill="#b73a26" stroke="#1a1715"/>
+            <text class="dg-text" x="8" y="15" fill="#f1e9d4">L0 · attention</text>
+            <rect x="0" y="24" width="220" height="22" fill="#354152" stroke="#1a1715"/>
+            <text class="dg-text" x="8" y="39" fill="#f1e9d4">L1 · recurrent (Mamba)</text>
+            <rect x="0" y="48" width="220" height="22" fill="#354152" stroke="#1a1715"/>
+            <text class="dg-text" x="8" y="63" fill="#f1e9d4">L2 · recurrent (Mamba)</text>
+            <rect x="0" y="72" width="220" height="22" fill="#b73a26" stroke="#1a1715"/>
+            <text class="dg-text" x="8" y="87" fill="#f1e9d4">L3 · attention</text>
+            <rect x="0" y="96" width="220" height="22" fill="#354152" stroke="#1a1715"/>
+            <text class="dg-text" x="8" y="111" fill="#f1e9d4">L4 · recurrent</text>
+          </g>
+        </g>
+
+        <!-- routing arrows -->
+        <g class="dg-stroke-soft">
+          <path d="M 250 61 L 480 60" stroke="#b73a26" stroke-width="1.4"/>
+          <path d="M 250 83 L 480 60" stroke="#b73a26" stroke-width="1.4"/>
+          <path d="M 250 35 L 480 130" stroke="#354152" stroke-width="1.4"/>
+          <path d="M 250 59 L 480 130" stroke="#354152" stroke-width="1.4"/>
+          <path d="M 250 107 L 480 130" stroke="#354152" stroke-width="1.4"/>
+        </g>
+
+        <!-- the two memories -->
+        <g transform="translate(500, 30)">
+          <g>
+            <text class="dg-label" x="0" y="22" fill="#b73a26">llama_kv_cache</text>
+            <rect x="0" y="30" width="340" height="40" fill="#e7decb" stroke="#1a1715"/>
+            <g fill="#b73a26" stroke="#1a1715" stroke-width="0.4">
+              <rect x="4" y="34" width="24" height="32"/>
+              <rect x="30" y="34" width="24" height="32"/>
+              <rect x="56" y="34" width="24" height="32"/>
+              <rect x="82" y="34" width="24" height="32"/>
+              <rect x="108" y="34" width="24" height="32"/>
+              <rect x="134" y="34" width="24" height="32"/>
+              <rect x="160" y="34" width="24" height="32"/>
+            </g>
+            <text class="dg-label" x="200" y="56" fill="#3a342c">…  KV slots</text>
+          </g>
+          <g transform="translate(0, 80)">
+            <text class="dg-label" x="0" y="22" fill="#354152">recurrent state buffer</text>
+            <rect x="0" y="30" width="340" height="40" fill="#dad0e0" stroke="#1a1715"/>
+            <g fill="#354152">
+              <rect x="4" y="34" width="100" height="32" opacity="0.85"/>
+              <rect x="120" y="34" width="100" height="32" opacity="0.85"/>
+              <rect x="236" y="34" width="100" height="32" opacity="0.85"/>
+            </g>
+            <text class="dg-label" x="20" y="86" fill="#3a342c">one fixed-size state per sequence per layer</text>
+          </g>
+        </g>
+      </svg>
+    </div>
+    <figcaption>
+      <span class="fig-num">Fig. 8.1</span>
+      <span class="fig-desc">Hybrid memory routes attention layers to the KV cache and recurrent layers to a state buffer. Both are sequence-aware; both respond to seq_* operations from the wrapper.</span>
+    </figcaption>
+  </figure>
+
+  <p>The hybrid wrapper is a recent addition and is exercised by a handful of architectures so far — RWKV variants and Mamba-style hybrids. The KV cache itself, viewed from outside the wrapper, is unchanged; it manages its layers exactly as before. But the abstraction it sits behind has been generalized: a model's memory is now a polymorphic <code>llama_memory_i</code>, not specifically a KV cache. That generalization is what made it possible to add hybrid models without changing every caller.</p>
+
+  <h2 data-section="§ 8.4">A few miscellaneous corners</h2>
+
+  <p>Three smaller details, mentioned for completeness.</p>
+
+  <p><strong>Variable V-cache padding.</strong> As described in <a href="02-layout.html">Chapter II</a>, when V widths differ per layer and flash attention is not in use, the cache pads all V buffers to the maximum width. The flag <code>TAG_V_CACHE_VARIABLE</code> records this. With flash attention, no padding is needed; the kernel handles variable widths directly.</p>
+
+  <p><strong>get_can_shift().</strong> Not every model can have its cache shifted: some position-encoding schemes don't support it, or do so only for certain ranges. The cache offers a method that returns whether a shift would be safe. The seq_add and seq_div operations call it before queueing their work; if it returns false, they return an error rather than corrupt the cache.</p>
+
+  <p><strong>The memory snapshot API.</strong> The library exposes a way to serialize the cache state to bytes and load it back. This is what makes "save a session and resume it later" possible — the cache, including all its metadata and data, is a first-class persistable object. The serialization respects quantization: a quantized cache loads back in its original dtype, no reconversion required.</p>
+
+  <h2 data-section="§ 8.5">A closing observation</h2>
+
+  <p>What strikes me, having walked the cache end to end, is how much of its complexity has been absorbed into <em>metadata</em>. Forking a sequence: a bit in a set. Shifting a window: an integer in an array, applied later by a graph. Composing two attention regimes: a wrapper that delegates. Quantization: a tensor dtype, transparent to the cache logic. Whenever an interesting feature has been added, the cache has answered it by adding to its metadata or by composing existing pieces, not by rewriting the data path.</p>
+
+  <p>The data path — the K and V tensors and the matmuls that consume them — has remained almost unchanged across years of additions. This is, I think, the right outcome for a cache. The data is what's expensive; the metadata is what's flexible. <em>Llama.cpp</em>'s KV cache draws the line between them with care, and most of the cache's surface area is on the metadata side, where care is cheap.</p>
+
+  <div class="callout">
+    <span class="label">The end</span>
+    <p>You now have the full vocabulary: cells, slots, sequences, streams, masks, the lifecycle, the variants, the additions. The source itself — <code>src/llama-kv-cache.{h,cpp}</code>, <code>llama-kv-cache-iswa.{h,cpp}</code>, <code>llama-kv-cells.h</code> — reads, I hope, like a book whose chapters you have already met.</p>
+  </div>
+
+  <nav class="footer-nav">
+    <a href="07-operations.html" class="prev">
+      <span class="label">Chapter VII</span>
+      <span class="ttl">The Lifecycle of an Operation</span>
+    </a>
+    <a href="index.html" class="next">
+      <span class="label">Back to start</span>
+      <span class="ttl">Contents</span>
+    </a>
+  </nav>
+
+</article>
+
+</body>
+</html>

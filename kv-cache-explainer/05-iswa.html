@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>V · Two Caches, Interleaved — The KV-Cache</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="running-head">
+  <div class="inner">
+    <span class="title">The KV-Cache</span>
+    <div class="nav">
+      <a href="index.html">Contents</a>
+      <a href="01-why-cache.html">I</a>
+      <a href="02-layout.html">II</a>
+      <a href="03-cells.html">III</a>
+      <a href="04-streams.html">IV</a>
+      <a href="05-iswa.html" aria-current="page">V</a>
+      <a href="06-mask.html">VI</a>
+      <a href="07-operations.html">VII</a>
+      <a href="08-beyond.html">VIII</a>
+    </div>
+    <span class="folio">05 / 08</span>
+  </div>
+</div>
+
+<article class="page">
+
+  <header class="chapter-head fade-up">
+    <div class="chapter-number">V.</div>
+    <div class="chapter-meta">
+      <div class="kicker">Chapter the Fifth</div>
+      <div>Variants</div>
+    </div>
+    <h1 class="chapter-title">Two Caches, Interleaved</h1>
+    <p class="chapter-subtitle">When some layers see the whole past and others only a window into it. The ISWA wrapper, Gemma, and the merits of asking less of a sliding cache.</p>
+  </header>
+
+  <p class="lede fade-up d1">
+    A model that mixes full-attention and sliding-window layers has two different
+    memory budgets. It deserves two different caches.
+  </p>
+
+  <p class="dropcap">Some recent architectures — Gemma in particular — interleave two kinds of attention layers. The first kind is the familiar one: every query attends to every prior token. The second kind is sliding-window attention (SWA): every query attends only to the most recent <em>W</em> tokens, where <em>W</em> is the window size. The interleaving pattern is fixed per model: a Gemma block might be six SWA layers followed by one full layer, repeating; the full layers are sparser and do the long-range work, while the SWA layers handle the local context cheaply.</p>
+
+  <p>The cache implication is direct. The SWA layers only ever consult the last <em>W</em> tokens; their cache need only hold that many. The full layers consult the entire history; their cache must hold all of it. One single cache sized for the full layers would waste enormous quantities of memory on the SWA layers. One single cache sized for the SWA layers would not work at all for the full ones. The answer is two caches, composed.</p>
+
+  <h2 data-section="§ 5.1">The wrapper</h2>
+
+  <p>This composition is the job of <code>llama_kv_cache_iswa</code>, defined in <code>src/llama-kv-cache-iswa.{h,cpp}</code>. It implements the same <code>llama_memory_i</code> interface as the unified cache — same methods, same semantics — but internally holds two underlying <code>llama_kv_cache</code> objects:</p>
+
+  <pre><span class="lbl">src/llama-kv-cache-iswa.h — line ~14</span><span class="kw">class</span> <span class="typ">llama_kv_cache_iswa</span> : <span class="kw">public</span> <span class="typ">llama_memory_i</span> {
+    std::unique_ptr&lt;<span class="typ">llama_kv_cache</span>&gt; kv_base;  <span class="cmt">// for full-attention layers</span>
+    std::unique_ptr&lt;<span class="typ">llama_kv_cache</span>&gt; kv_swa;   <span class="cmt">// for SWA layers</span>
+
+    <span class="cmt">// every method on this class delegates to one or both of the above.</span>
+};</pre>
+
+  <p>It is a strict delegation. Methods that affect cache state — <code>seq_cp</code>, <code>seq_rm</code>, <code>seq_add</code>, <code>clear</code>, <code>defrag</code> — run on both underlying caches in turn, because both caches own metadata for the same sequences. Methods that produce a graph or a slot allocation are dispatched to the appropriate underlying cache for each layer based on whether that layer is SWA or full.</p>
+
+  <figure class="full">
+    <div class="diagram-frame">
+      <svg viewBox="0 0 880 320" xmlns="http://www.w3.org/2000/svg">
+        <text class="dg-title" x="20" y="24">A model with interleaved SWA and full layers</text>
+        <text class="dg-label" x="20" y="40">six SWA + one full · repeating, top to bottom</text>
+
+        <!-- left: layer stack -->
+        <g transform="translate(30, 60)">
+          <text class="dg-label" x="0" y="-8">layer stack</text>
+          <!-- 14 layers, pattern: S S S S S S F -->
+          <g>
+            <g>
+              <rect x="0" y="0" width="180" height="22" fill="#d8c8a0" stroke="#1a1715"/>
+              <text class="dg-text" x="8" y="15">L0  · SWA</text>
+              <rect x="0" y="24" width="180" height="22" fill="#d8c8a0" stroke="#1a1715"/>
+              <text class="dg-text" x="8" y="39">L1  · SWA</text>
+              <rect x="0" y="48" width="180" height="22" fill="#d8c8a0" stroke="#1a1715"/>
+              <text class="dg-text" x="8" y="63">L2  · SWA</text>
+              <rect x="0" y="72" width="180" height="22" fill="#d8c8a0" stroke="#1a1715"/>
+              <text class="dg-text" x="8" y="87">L3  · SWA</text>
+              <rect x="0" y="96" width="180" height="22" fill="#d8c8a0" stroke="#1a1715"/>
+              <text class="dg-text" x="8" y="111">L4  · SWA</text>
+              <rect x="0" y="120" width="180" height="22" fill="#d8c8a0" stroke="#1a1715"/>
+              <text class="dg-text" x="8" y="135">L5  · SWA</text>
+            </g>
+            <rect x="0" y="144" width="180" height="22" fill="#b73a26" stroke="#1a1715"/>
+            <text class="dg-text" x="8" y="159" fill="#f1e9d4">L6  · FULL</text>
+            <g>
+              <rect x="0" y="168" width="180" height="22" fill="#d8c8a0" stroke="#1a1715"/>
+              <text class="dg-text" x="8" y="183">L7  · SWA</text>
+              <rect x="0" y="192" width="180" height="22" fill="#d8c8a0" stroke="#1a1715"/>
+              <text class="dg-text" x="8" y="207">L8  · SWA</text>
+              <rect x="0" y="216" width="180" height="22" fill="#d8c8a0" stroke="#1a1715"/>
+              <text class="dg-text" x="8" y="231">L9  · SWA</text>
+            </g>
+            <rect x="0" y="240" width="180" height="14" fill="#e7decb" stroke="#c8b890" stroke-dasharray="2 2"/>
+            <text class="dg-label" x="80" y="251" fill="#8d7e5c">…</text>
+          </g>
+        </g>
+
+        <!-- arrows / routing -->
+        <g class="dg-stroke-soft">
+          <path d="M 220 71 Q 290 71 290 100 L 410 100" />
+          <path d="M 220 95 Q 290 95 290 100 L 410 100" />
+          <path d="M 220 119 Q 290 119 290 100 L 410 100" />
+          <path d="M 220 11 Q 290 11 290 100 L 410 100" />
+          <path d="M 220 35 Q 290 35 290 100 L 410 100" />
+          <path d="M 220 155 Q 290 155 290 220 L 410 220" stroke="#b73a26" stroke-width="1.4"/>
+          <path d="M 220 179 Q 290 179 290 100 L 410 100" />
+          <path d="M 220 203 Q 290 203 290 100 L 410 100" />
+        </g>
+
+        <!-- right: two caches -->
+        <g transform="translate(420, 60)">
+          <!-- SWA cache -->
+          <g>
+            <text class="dg-label" x="0" y="-8">kv_swa  · small, window-sized</text>
+            <rect x="0" y="0" width="430" height="100" fill="#e7decb" stroke="#1a1715"/>
+            <g fill="#d8c8a0" stroke="#1a1715" stroke-width="0.4">
+              <rect x="4" y="4" width="20" height="44"/>
+              <rect x="26" y="4" width="20" height="44"/>
+              <rect x="48" y="4" width="20" height="44"/>
+              <rect x="70" y="4" width="20" height="44"/>
+              <rect x="92" y="4" width="20" height="44"/>
+              <rect x="114" y="4" width="20" height="44"/>
+              <rect x="136" y="4" width="20" height="44"/>
+              <rect x="158" y="4" width="20" height="44"/>
+              <rect x="4" y="52" width="20" height="44"/>
+              <rect x="26" y="52" width="20" height="44"/>
+              <rect x="48" y="52" width="20" height="44"/>
+              <rect x="70" y="52" width="20" height="44"/>
+              <rect x="92" y="52" width="20" height="44"/>
+              <rect x="114" y="52" width="20" height="44"/>
+              <rect x="136" y="52" width="20" height="44"/>
+              <rect x="158" y="52" width="20" height="44"/>
+            </g>
+            <text class="dg-label" x="190" y="56">capacity ≈ n_swa + small slack</text>
+          </g>
+
+          <!-- full cache -->
+          <g transform="translate(0, 120)">
+            <text class="dg-label" x="0" y="-8">kv_base  · large, full context</text>
+            <rect x="0" y="0" width="430" height="120" fill="#e7decb" stroke="#1a1715"/>
+            <g fill="#b73a26" stroke="#1a1715" stroke-width="0.4" opacity="0.85">
+              <!-- many cells stretching the whole row -->
+              <rect x="4" y="4" width="20" height="22"/>
+              <rect x="26" y="4" width="20" height="22"/>
+              <rect x="48" y="4" width="20" height="22"/>
+              <rect x="70" y="4" width="20" height="22"/>
+              <rect x="92" y="4" width="20" height="22"/>
+              <rect x="114" y="4" width="20" height="22"/>
+              <rect x="136" y="4" width="20" height="22"/>
+              <rect x="158" y="4" width="20" height="22"/>
+              <rect x="180" y="4" width="20" height="22"/>
+              <rect x="202" y="4" width="20" height="22"/>
+              <rect x="224" y="4" width="20" height="22"/>
+              <rect x="246" y="4" width="20" height="22"/>
+              <rect x="268" y="4" width="20" height="22"/>
+              <rect x="290" y="4" width="20" height="22"/>
+              <rect x="312" y="4" width="20" height="22"/>
+              <rect x="334" y="4" width="20" height="22"/>
+              <rect x="356" y="4" width="20" height="22"/>
+              <rect x="378" y="4" width="20" height="22"/>
+              <rect x="400" y="4" width="20" height="22"/>
+            </g>
+            <text class="dg-label" x="4" y="62">capacity = full n_ctx</text>
+          </g>
+        </g>
+      </svg>
+    </div>
+    <figcaption>
+      <span class="fig-num">Fig. 5.1</span>
+      <span class="fig-desc">Each layer is routed to one cache or the other based on its attention type. The SWA cache only needs to be large enough to hold the window; the full cache holds the whole context.</span>
+    </figcaption>
+  </figure>
+
+  <h2 data-section="§ 5.2">Sizing the SWA cache</h2>
+
+  <p>The savings come from the SWA cache's size. The constructor for <code>llama_kv_cache_iswa</code> computes it as:</p>
+
+  <pre><span class="lbl">src/llama-kv-cache-iswa.cpp — line ~46</span><span class="kw">const</span> <span class="typ">uint32_t</span> size_swa =
+    std::min(size_base, hparams.n_swa * n_seq_max + n_ubatch);
+
+<span class="cmt">// padded to a multiple of 256 for backend-friendly shapes</span>
+<span class="kw">const</span> <span class="typ">uint32_t</span> size_swa_padded =
+    GGML_PAD(size_swa, 256);</pre>
+
+  <p>Three terms, each justified. The <code>n_swa</code> is the window width, which is what any single sequence can possibly attend to in an SWA layer. We multiply by <code>n_seq_max</code> because the cache must accommodate that many sequences concurrently, each with its own window. We add <code>n_ubatch</code> as headroom: a single ubatch may temporarily extend a sequence's footprint beyond the window before the older tokens are evicted, and the allocator needs slack to land that ubatch somewhere. The <code>min</code> with <code>size_base</code> caps the SWA cache at the full-cache size, since there is no point making the supposedly-smaller cache larger than the larger one.</p>
+
+  <p>The pad to 256 is for the underlying tensor shapes: many GGML kernels prefer their second dimensions to be a multiple of 256, and the small over-allocation buys back any performance the awkward shape would have cost. A Gemma 4 model in this scheme might have <code>size_base = 32k</code> and <code>size_swa ≈ 2.3k</code>, depending on the window width — a fourteen-fold reduction in the cache memory needed for the SWA layers.</p>
+
+  <aside class="margin">
+    <span class="ref">§ 5.2 — gemma</span>
+    Gemma 2 / 3 use a 4k SWA window with a much larger full-context budget. Gemma 4 keeps the same composition. The ISWA wrapper was added to llama.cpp specifically to give those models a tractable memory profile.
+  </aside>
+
+  <h2 data-section="§ 5.3">The delegation pattern</h2>
+
+  <p>The wrapper's methods follow a single pattern: dispatch to both children, then combine. <code>seq_rm(seq, p0, p1)</code> removes the sequence from both caches; <code>seq_cp</code> copies it in both; <code>clear()</code> clears both. The pattern is mechanical and the file that implements it is correspondingly short:</p>
+
+  <pre><span class="lbl">src/llama-kv-cache-iswa.cpp — line ~75</span><span class="kw">bool</span> <span class="typ">llama_kv_cache_iswa</span>::<span class="fn">seq_rm</span>(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    <span class="kw">bool</span> r = <span class="kw">true</span>;
+    r &amp;= kv_base-&gt;<span class="fn">seq_rm</span>(seq_id, p0, p1);
+    r &amp;= kv_swa-&gt;<span class="fn">seq_rm</span>(seq_id, p0, p1);
+    <span class="kw">return</span> r;
+}
+
+<span class="kw">void</span> <span class="typ">llama_kv_cache_iswa</span>::<span class="fn">clear</span>() {
+    kv_base-&gt;<span class="fn">clear</span>();
+    kv_swa-&gt;<span class="fn">clear</span>();
+}
+
+<span class="cmt">// ...and so on for every method that mutates state.</span></pre>
+
+  <p>The one place where the wrapper does more than delegate is when it produces a memory context for use by the model's forward pass. There, it has to know which layers belong to which cache, and it returns a composite context that routes layer-level queries to the right child. The model's graph-building code doesn't need to know which kind of cache it has; it asks for the K and V buffers for its current layer, and the right ones come back.</p>
+
+  <h2 data-section="§ 5.4">When ISWA is, and isn't</h2>
+
+  <p>The wrapper exists only when the model has both kinds of layers. Models without SWA layers do not need it; models with only SWA layers (rare in practice) could use a single SWA-sized cache. The decision is made at load time based on the model's hyperparameters: if any layer has a non-zero window, and any layer doesn't, the cache is an <code>llama_kv_cache_iswa</code>; otherwise it's a plain <code>llama_kv_cache</code>.</p>
+
+  <p>For our purposes, the important takeaway is that the ISWA wrapper does <em>not</em> change how the cache works. It composes two caches that work the way the previous chapters have described. The only thing that changes is the routing: a query in an SWA layer consults the SWA cache, a query in a full layer consults the full one, and the wrapper makes that consultation happen automatically.</p>
+
+  <p>With that, we have described every container of cached state in <em>llama.cpp</em>. The next chapter steps inside attention to ask the question that turns the cache from a passive store into an active filter: how is the mask built? Which slot is admissible for which query? The answer is a dense float matrix and a careful loop, and we are now ready for it.</p>
+
+  <nav class="footer-nav">
+    <a href="04-streams.html" class="prev">
+      <span class="label">Chapter IV</span>
+      <span class="ttl">Streams and Sequences</span>
+    </a>
+    <a href="06-mask.html" class="next">
+      <span class="label">Chapter VI</span>
+      <span class="ttl">Building the Mask</span>
+    </a>
+  </nav>
+
+</article>
+
+</body>
+</html>

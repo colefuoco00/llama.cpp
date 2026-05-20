@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>II · The Layout in Memory — The KV-Cache</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="running-head">
+  <div class="inner">
+    <span class="title">The KV-Cache</span>
+    <div class="nav">
+      <a href="index.html">Contents</a>
+      <a href="01-why-cache.html">I</a>
+      <a href="02-layout.html" aria-current="page">II</a>
+      <a href="03-cells.html">III</a>
+      <a href="04-streams.html">IV</a>
+      <a href="05-iswa.html">V</a>
+      <a href="06-mask.html">VI</a>
+      <a href="07-operations.html">VII</a>
+      <a href="08-beyond.html">VIII</a>
+    </div>
+    <span class="folio">02 / 08</span>
+  </div>
+</div>
+
+<article class="page">
+
+  <header class="chapter-head fade-up">
+    <div class="chapter-number">II.</div>
+    <div class="chapter-meta">
+      <div class="kicker">Chapter the Second</div>
+      <div>Storage</div>
+    </div>
+    <h1 class="chapter-title">The Layout in Memory</h1>
+    <p class="chapter-subtitle">Where the K and V actually live: their shapes, their dtypes, the curious matter of whether V is stored transposed, and what a quantized cache buys.</p>
+  </header>
+
+  <p class="lede fade-up d1">
+    A tensor is a shape and a dtype. Once you know both, the rest is allocator
+    arithmetic — but the shape is the thing to get right first.
+  </p>
+
+  <p class="dropcap">The cache is not one tensor. It is two tensors per layer, repeated <em>L</em> times. The constructor in <code>src/llama-kv-cache.cpp</code> walks the model's layer list, asks the model what dimensions K and V should have at that depth, and allocates a pair of buffers. The result lives in a vector of <code>kv_layer</code> structs, each holding a K tensor, a V tensor, and a handful of pre-computed views into them.</p>
+
+  <pre><span class="lbl">src/llama-kv-cache.h — line ~215</span><span class="kw">struct</span> <span class="typ">kv_layer</span> {
+  <span class="cmt">// the layer index in the model (a layer may be skipped, e.g. MTP)</span>
+  <span class="typ">uint32_t</span> il;
+
+  <span class="typ">ggml_tensor</span> * k;          <span class="cmt">// [n_embd_k_gqa, kv_size, n_stream]</span>
+  <span class="typ">ggml_tensor</span> * v;          <span class="cmt">// [n_embd_v_gqa, kv_size, n_stream]   (or transposed)</span>
+
+  std::vector&lt;<span class="typ">ggml_tensor</span> *&gt; k_stream;  <span class="cmt">// per-stream views</span>
+  std::vector&lt;<span class="typ">ggml_tensor</span> *&gt; v_stream;
+};</pre>
+
+  <h2 data-section="§ 2.1">The shape, piece by piece</h2>
+
+  <p>The K tensor has three dimensions. The first, <code>n_embd_k_gqa</code>, is the total width of the key projection — the per-head dimension multiplied by the number of <em>key</em> heads. In a vanilla multi-head transformer the number of key heads equals the number of query heads; under grouped-query attention (GQA), it can be much smaller. The GQA in the name is the giveaway: this is the <em>after-grouping</em> width, the one that actually has to be stored.</p>
+
+  <aside class="margin">
+    <span class="ref">§ 2.1 — gqa</span>
+    Grouped-query attention is one of the most important savings in modern LLM design precisely <em>because</em> it shrinks this dimension. Eight query heads sharing one key head means the cache pays for one head, not eight.
+  </aside>
+
+  <p>The second dimension, <code>kv_size</code>, is the capacity of the cache in tokens — how many slots it has. This is fixed at construction. The third dimension, <code>n_stream</code>, is the number of physical partitions, which we will not dwell on here because <a href="04-streams.html">Chapter IV</a> is devoted to it. For now, treat it as <em>1</em> in your head.</p>
+
+  <p>The V tensor has the same shape on paper — substitute <code>n_embd_v_gqa</code> for the first dim — but a switch in the constructor controls whether the storage is transposed:</p>
+
+  <pre><span class="lbl">src/llama-kv-cache.cpp — line ~200</span><span class="cmt">// when v_trans is true, V is stored as [kv_size, n_embd_v_gqa, n_stream]</span>
+<span class="cmt">// otherwise as [n_embd_v_gqa, kv_size, n_stream], like K.</span>
+
+<span class="kw">if</span> (v_trans) {
+    layer.v = ggml_new_tensor_3d(ctx, type_v, kv_size, n_embd_v_gqa, n_stream);
+} <span class="kw">else</span> {
+    layer.v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+}</pre>
+
+  <p>Transposing V is not for elegance; it is for the matmul. The attention output for a single query is <em>softmax(Q·Kᵀ) · V</em>. When V is stored transposed (<code>kv_size</code> along the contiguous axis), the right multiplication of the softmax vector with V becomes a stride-friendly contraction. Whether to do it depends on the backend and on whether flash attention is in use; the cache supports both because the surrounding compute graphs do.</p>
+
+  <h2 data-section="§ 2.2">A picture of one layer</h2>
+
+  <figure class="full">
+    <div class="diagram-frame">
+      <svg viewBox="0 0 880 320" xmlns="http://www.w3.org/2000/svg">
+        <!-- K tensor -->
+        <g transform="translate(60,40)">
+          <text class="dg-title" x="0" y="-12">K — one layer</text>
+          <text class="dg-label" x="0" y="2">shape · [n_embd_k_gqa, kv_size, n_stream]</text>
+
+          <!-- 3D box, "isometric" -->
+          <g transform="translate(0,20)">
+            <!-- front face -->
+            <rect x="0" y="40" width="280" height="160" class="dg-fill" />
+            <!-- grid of cells -->
+            <g stroke="#1a1715" stroke-width="0.3" opacity="0.5">
+              <line x1="0"   y1="60"  x2="280" y2="60"/>
+              <line x1="0"   y1="80"  x2="280" y2="80"/>
+              <line x1="0"   y1="100" x2="280" y2="100"/>
+              <line x1="0"   y1="120" x2="280" y2="120"/>
+              <line x1="0"   y1="140" x2="280" y2="140"/>
+              <line x1="0"   y1="160" x2="280" y2="160"/>
+              <line x1="0"   y1="180" x2="280" y2="180"/>
+              <!-- vertical lines -->
+              <line x1="40"  y1="40" x2="40"  y2="200"/>
+              <line x1="80"  y1="40" x2="80"  y2="200"/>
+              <line x1="120" y1="40" x2="120" y2="200"/>
+              <line x1="160" y1="40" x2="160" y2="200"/>
+              <line x1="200" y1="40" x2="200" y2="200"/>
+              <line x1="240" y1="40" x2="240" y2="200"/>
+            </g>
+            <!-- top face -->
+            <polygon points="0,40 30,20 310,20 280,40" class="dg-fill-soft" />
+            <!-- side face -->
+            <polygon points="280,40 310,20 310,180 280,200" class="dg-fill-soft" />
+            <!-- some "filled" cells -->
+            <g fill="#b73a26">
+              <rect x="1"   y="41" width="38" height="18"/>
+              <rect x="41"  y="41" width="38" height="18"/>
+              <rect x="81"  y="41" width="38" height="18"/>
+              <rect x="121" y="41" width="38" height="18"/>
+              <rect x="161" y="41" width="38" height="18"/>
+            </g>
+
+            <!-- axis labels -->
+            <text class="dg-label" x="0" y="220">→ n_embd_k_gqa (head_dim × n_kv_heads)</text>
+            <line x1="-12" y1="40"  x2="-12" y2="200" class="dg-stroke"/>
+            <text class="dg-label" x="-58" y="120" transform="rotate(-90, -58, 120)">kv_size →</text>
+
+            <text class="dg-label" x="320" y="34">n_stream</text>
+          </g>
+        </g>
+
+        <!-- divider -->
+        <line x1="450" y1="20" x2="450" y2="300" class="dg-stroke-soft dg-dashed"/>
+
+        <!-- V tensor (transposed) -->
+        <g transform="translate(490,40)">
+          <text class="dg-title" x="0" y="-12">V — transposed (v_trans = true)</text>
+          <text class="dg-label" x="0" y="2">shape · [kv_size, n_embd_v_gqa, n_stream]</text>
+
+          <g transform="translate(0,20)">
+            <rect x="0" y="40" width="280" height="160" class="dg-fill" />
+            <g stroke="#1a1715" stroke-width="0.3" opacity="0.5">
+              <line x1="35"  y1="40"  x2="35"  y2="200"/>
+              <line x1="70"  y1="40"  x2="70"  y2="200"/>
+              <line x1="105" y1="40"  x2="105" y2="200"/>
+              <line x1="140" y1="40"  x2="140" y2="200"/>
+              <line x1="175" y1="40"  x2="175" y2="200"/>
+              <line x1="210" y1="40"  x2="210" y2="200"/>
+              <line x1="245" y1="40"  x2="245" y2="200"/>
+              <line x1="0"   y1="80"  x2="280" y2="80"/>
+              <line x1="0"   y1="120" x2="280" y2="120"/>
+              <line x1="0"   y1="160" x2="280" y2="160"/>
+            </g>
+            <polygon points="0,40 30,20 310,20 280,40" class="dg-fill-soft" />
+            <polygon points="280,40 310,20 310,180 280,200" class="dg-fill-soft" />
+            <!-- filled column showing position-major -->
+            <g fill="#354152">
+              <rect x="1"   y="41" width="33" height="38"/>
+              <rect x="1"   y="81" width="33" height="38"/>
+              <rect x="1"   y="121" width="33" height="38"/>
+            </g>
+            <text class="dg-label" x="0" y="220">→ kv_size (along contiguous axis)</text>
+            <line x1="-12" y1="40"  x2="-12" y2="200" class="dg-stroke"/>
+            <text class="dg-label" x="-58" y="120" transform="rotate(-90, -58, 120)">n_embd_v_gqa →</text>
+          </g>
+        </g>
+      </svg>
+    </div>
+    <figcaption>
+      <span class="fig-num">Fig. 2.1</span>
+      <span class="fig-desc">The cache for one layer is two 3-D tensors. K stores embeddings along the contiguous axis; V, when transposed, stores positions along it — better for the softmax→V multiply.</span>
+    </figcaption>
+  </figure>
+
+  <h2 data-section="§ 2.3">The dtype question</h2>
+
+  <p>K and V do not have to be stored in the same dtype the model computes them in. The constructor accepts a <code>type_k</code> and <code>type_v</code> independently; you can store K at fp16 and V at q8_0, or both at q4_0, or any other combination GGML's quantization machinery supports. There is no special path for quantized cache reads or writes: the tensors are allocated with the requested type, and the matmul kernel does the dequantization on the fly, the same way it does for the model's frozen weights.</p>
+
+  <p>This is one of those moments where the simplicity of the GGML abstractions pays off twice. Because every operation that touches K or V goes through <code>ggml_mul_mat</code> (or an equivalent), the choice of dtype is a property of the tensor, not of the cache logic. The seq_cp, seq_rm, find_slot machinery never touches the data — it only touches metadata. So as far as the cache <em>logic</em> is concerned, the bytes in the tensor are opaque.</p>
+
+  <div class="callout">
+    <span class="label">Operating point</span>
+    <p>At 32k context, a 7B-class model with <code>n_kv_heads = 8</code> and <code>head_dim = 128</code> across 32 layers stores roughly:</p>
+    <ul class="dashes" style="margin-top:0.4rem;">
+      <li>fp16:  ~4.0 GiB total cache</li>
+      <li>q8_0:  ~2.1 GiB total cache</li>
+      <li>q4_0:  ~1.1 GiB total cache</li>
+    </ul>
+    <p>The quality cost of q8_0 is, in practice, negligible. The quality cost of q4_0 is real and depends on the model.</p>
+  </div>
+
+  <h2 data-section="§ 2.4">What gets allocated, and when</h2>
+
+  <p>All cache memory is allocated up front, at the moment the <code>llama_kv_cache</code> is constructed. There is no dynamic growth: if the cache fills, the eviction logic — or, more commonly, the caller's batching code — must make room. The motivation is partly performance (no allocator calls in the hot path) and partly platform (GPU buffers do not like to grow). The cost is that <code>kv_size</code> has to be chosen at the start of the session, and chosen large enough.</p>
+
+  <pre><span class="lbl">src/llama-kv-cache.cpp — constructor</span><span class="kw">for</span> (<span class="kw">uint32_t</span> il = 0; il &lt; n_layer_cache; ++il) {
+    <span class="kw">const</span> <span class="kw">uint32_t</span> n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+    <span class="kw">const</span> <span class="kw">uint32_t</span> n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+
+    <span class="typ">ggml_tensor</span> * k = ggml_new_tensor_3d(ctx_layer,
+                          type_k, n_embd_k_gqa, kv_size, n_stream);
+    <span class="typ">ggml_tensor</span> * v = ggml_new_tensor_3d(ctx_layer,
+                          type_v,
+                          v_trans ? kv_size       : n_embd_v_gqa,
+                          v_trans ? n_embd_v_gqa  : kv_size,
+                          n_stream);
+
+    layers.push_back({ il, k, v, /* per-stream views */ });
+}</pre>
+
+  <p>Note <code>n_layer_cache</code> rather than <code>n_layer</code>. Some architectures (multi-token-prediction heads, certain hybrids) do not cache every layer. The cache walks only the layers the model actually wants cached, and <code>kv_layer::il</code> records the original layer index so the rest of the graph can find the right buffers.</p>
+
+  <aside class="margin">
+    <span class="ref">cf. § 8.2</span>
+    Gemma 4's multi-token-prediction (MTP) heads are an example: the draft heads share the trunk's K and V for the layers they re-use, and only cache K/V for the layers they introduce.
+  </aside>
+
+  <h2 data-section="§ 2.5">Variable V-width: the padding trick</h2>
+
+  <p>For most models, every layer's V embedding has the same width, and the cache is a simple stack of identically-shaped tensors. For a few architectures, V widths differ between layers — and if flash attention is not available to handle this directly, the surrounding compute graph wants the V tensors to have constant shape so it can be re-used across decode steps. The cache handles this by allocating every layer's V to the maximum width found in the model, and recording the imbalance as a flag (the implementation labels this <code>TAG_V_CACHE_VARIABLE</code>). The unused entries are simply written and ignored.</p>
+
+  <p>It is a slightly wasteful arrangement, and it exists only for the awkward intersection of <em>variable V widths</em> and <em>no flash attention</em>. When flash attention is available, the kernel can consume the layer-specific widths directly and no padding is needed.</p>
+
+  <h2 data-section="§ 2.6">What we have not stored</h2>
+
+  <p>It is worth saying explicitly what the cache does <em>not</em> contain. It does not store the queries (queries are computed once per step and immediately consumed). It does not store the hidden states (the model state at each position is not needed once K and V are derived from it). It does not store the attention <em>outputs</em>. It does not store the RoPE-rotated form of K — RoPE is, in this implementation, applied on the way in to K so that what is cached is the rotated form, and re-rotation under position shifts is handled by a special graph (see <a href="07-operations.html">Chapter VII</a>).</p>
+
+  <p>What is in the cache is exactly what attention needs to consume: post-projection, post-rotation K and V vectors, indexed by physical slot. Everything else is metadata, and that metadata is the subject of the next chapter.</p>
+
+  <nav class="footer-nav">
+    <a href="01-why-cache.html" class="prev">
+      <span class="label">Chapter I</span>
+      <span class="ttl">Why Cache at All</span>
+    </a>
+    <a href="03-cells.html" class="next">
+      <span class="label">Chapter III</span>
+      <span class="ttl">Cells, Slots, and the Allocator</span>
+    </a>
+  </nav>
+
+</article>
+
+</body>
+</html>

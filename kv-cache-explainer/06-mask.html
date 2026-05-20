@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VI · Building the Mask — The KV-Cache</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="running-head">
+  <div class="inner">
+    <span class="title">The KV-Cache</span>
+    <div class="nav">
+      <a href="index.html">Contents</a>
+      <a href="01-why-cache.html">I</a>
+      <a href="02-layout.html">II</a>
+      <a href="03-cells.html">III</a>
+      <a href="04-streams.html">IV</a>
+      <a href="05-iswa.html">V</a>
+      <a href="06-mask.html" aria-current="page">VI</a>
+      <a href="07-operations.html">VII</a>
+      <a href="08-beyond.html">VIII</a>
+    </div>
+    <span class="folio">06 / 08</span>
+  </div>
+</div>
+
+<article class="page">
+
+  <header class="chapter-head fade-up">
+    <div class="chapter-number">VI.</div>
+    <div class="chapter-meta">
+      <div class="kicker">Chapter the Sixth</div>
+      <div>Admissibility</div>
+    </div>
+    <h1 class="chapter-title">Building the Mask</h1>
+    <p class="chapter-subtitle">A dense float matrix that decides, for every query token in the current ubatch, which past slots it is allowed to see.</p>
+  </header>
+
+  <p class="lede fade-up d1">
+    The cache stores everything that <em>could</em> be attended to. The mask
+    decides what <em>will</em> be. It is where causality, sequence isolation,
+    and sliding windows are all enforced at once.
+  </p>
+
+  <p class="dropcap">When an attention op runs, it does not consult the cells directly. It consults a mask — a dense matrix of additive bias values, one per (query token, key slot) pair. Where the mask is zero, the attention proceeds normally. Where the mask is <em>-∞</em>, the softmax sends the probability to zero and the slot is, for this query, invisible. Constructing this matrix correctly is the job of <code>set_input_kq_mask</code>, and it is the place where the cache's metadata becomes operationally consequential.</p>
+
+  <h2 data-section="§ 6.1">The shape of the matrix</h2>
+
+  <p>The mask is dimensioned [<em>n_kv</em>, <em>n_tokens</em>]: for every cached slot the cache considers reachable, and every query token in the current ubatch, one float. In the unified case, <em>n_kv</em> is at most <code>kv_size</code> — the full cache capacity — though in practice the loop early-outs on slots that are empty. For each (q, k) cell of the matrix, the question is: does the query at position q attend to the key at slot k? The cache answers by walking a checklist.</p>
+
+  <pre><span class="lbl">conceptual — the checklist</span>mask[q, k] = -∞   <span class="kw">if</span> any of:
+                  <span class="kw">cells</span>[k].pos == -1            <span class="cmt">// the slot is empty</span>
+                  <span class="kw">cells</span>[k].seq.has(seq[q]) == <span class="kw">false</span>  <span class="cmt">// wrong sequence</span>
+                  <span class="kw">cells</span>[k].pos &gt; pos[q]            <span class="cmt">// future (non-causal)</span>
+                  <span class="kw">cells</span>[k].pos &lt; pos[q] - n_swa   <span class="cmt">// outside SWA window</span>
+              =  0    <span class="kw">otherwise</span></pre>
+
+  <p>Four conditions, in this order: emptiness, sequence membership, causality, and the sliding window. Each is a single check against the cell's metadata. Together they produce the mask. The implementation, of course, is more careful — it caches results across consecutive query tokens that share a sequence, it handles ALiBi position biases, it handles 2-D positions for M-RoPE models — but the conceptual content is the four-line predicate above.</p>
+
+  <h2 data-section="§ 6.2">A mask, drawn</h2>
+
+  <p>Here is a small example. Three query tokens (the rows below) attend into a cache with seven slots (the columns). Two sequences are in flight; the queries belong to sequence 0; one of the cached slots is empty; one belongs to sequence 1. The window width <em>W</em> = 4. Vermillion cells are admissible; pale cells are masked. The matrix entries are exactly the values that the attention softmax will see.</p>
+
+  <figure class="full">
+    <div class="diagram-frame">
+      <div style="display:flex; gap:3rem; flex-wrap:wrap; align-items:flex-start;">
+        <div>
+          <div style="font-family:var(--mono); font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:var(--accent); margin-bottom:0.5rem;">cache state</div>
+          <div style="display:grid; grid-template-columns: repeat(7, 1fr); gap: 3px; max-width: 280px;">
+            <!-- 7 cells -->
+            <div class="cell s0"><span class="pos">0</span><span class="sid">{0}</span></div>
+            <div class="cell s0"><span class="pos">1</span><span class="sid">{0}</span></div>
+            <div class="cell s0"><span class="pos">2</span><span class="sid">{0}</span></div>
+            <div class="cell s1"><span class="pos">0</span><span class="sid">{1}</span></div>
+            <div class="cell s0"><span class="pos">3</span><span class="sid">{0}</span></div>
+            <div class="cell s0"><span class="pos">4</span><span class="sid">{0}</span></div>
+            <div class="cell empty"><span class="pos">·</span></div>
+          </div>
+          <div style="font-family:var(--mono); font-size:11px; color:var(--ink-soft); margin-top:0.6rem;">
+            slot:   k₀  k₁  k₂  k₃  k₄  k₅  k₆<br>
+            pos:    0   1   2   0   3   4   ·<br>
+            owner:  {0} {0} {0} {1} {0} {0} ·
+          </div>
+        </div>
+
+        <div>
+          <div style="font-family:var(--mono); font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:var(--accent); margin-bottom:0.5rem;">resulting mask · seq 0 · W=4</div>
+          <div style="display:flex; gap:0;">
+            <!-- row labels -->
+            <div style="display:flex; flex-direction:column; font-family:var(--mono); font-size:11px; color:var(--ink-soft);">
+              <div style="height:26px; display:flex; align-items:center; padding-right:8px;">q@4</div>
+              <div style="height:26px; display:flex; align-items:center; padding-right:8px;">q@5</div>
+              <div style="height:26px; display:flex; align-items:center; padding-right:8px;">q@6</div>
+            </div>
+            <div class="mask-matrix">
+              <div class="row">
+                <div class="cell-m attend">0</div>
+                <div class="cell-m attend">0</div>
+                <div class="cell-m attend">0</div>
+                <div class="cell-m mask">∞</div>
+                <div class="cell-m attend">0</div>
+                <div class="cell-m attend">0</div>
+                <div class="cell-m mask">∞</div>
+              </div>
+              <div class="row">
+                <div class="cell-m mask">∞</div>
+                <div class="cell-m attend">0</div>
+                <div class="cell-m attend">0</div>
+                <div class="cell-m mask">∞</div>
+                <div class="cell-m attend">0</div>
+                <div class="cell-m attend">0</div>
+                <div class="cell-m mask">∞</div>
+              </div>
+              <div class="row">
+                <div class="cell-m mask">∞</div>
+                <div class="cell-m mask">∞</div>
+                <div class="cell-m attend">0</div>
+                <div class="cell-m mask">∞</div>
+                <div class="cell-m attend">0</div>
+                <div class="cell-m attend">0</div>
+                <div class="cell-m mask">∞</div>
+              </div>
+            </div>
+          </div>
+          <div style="font-family:var(--mono); font-size:11px; color:var(--ink-soft); margin-top:0.6rem; line-height:1.5;">
+            q@4: sees pos 0..4 of seq 0, skips k₃ (wrong seq), skips k₆ (empty).<br>
+            q@5: sees pos 1..5 (W=4 evicts pos 0), skips k₀ now too.<br>
+            q@6: sees pos 2..6 (W=4 evicts pos 1 also).
+          </div>
+        </div>
+      </div>
+    </div>
+    <figcaption>
+      <span class="fig-num">Fig. 6.1</span>
+      <span class="fig-desc">A 3 × 7 mask. Empty slots, wrong-sequence slots, and out-of-window slots are all masked to <em>-∞</em>. Only admissible slots receive a zero bias.</span>
+    </figcaption>
+  </figure>
+
+  <h2 data-section="§ 6.3">Where it's built</h2>
+
+  <p>The implementation lives in <code>set_input_kq_mask</code>, in <code>src/llama-kv-cache.cpp</code>. The body is a template parameterised on whether SWA is in effect, whether the model uses ALiBi, and whether 2-D positions are needed; the template lets the compiler emit a tight, branchless inner loop for each combination instead of leaving the predicate evaluation to runtime. The structure of one specialisation:</p>
+
+  <pre><span class="lbl">src/llama-kv-cache.cpp — ~ line 1418</span><span class="kw">template</span> &lt;<span class="kw">bool</span> swa, <span class="kw">bool</span> alibi&gt;
+<span class="kw">void</span> <span class="fn">set_input_kq_mask_impl</span>(<span class="typ">mask_args</span> &amp; args) {
+    <span class="kw">for</span> (<span class="typ">uint32_t</span> q = 0; q &lt; n_tokens; ++q) {
+        <span class="kw">const</span> llama_pos    qp = ubatch.pos[q];
+        <span class="kw">const</span> llama_seq_id qs = ubatch.seq_id[q];
+
+        <span class="kw">for</span> (<span class="typ">uint32_t</span> k : cells.used) {
+            <span class="kw">const</span> llama_pos kp = cells.pos[k];
+
+            <span class="kw">if</span> (!cells.seq[k].has(qs))   { mask[q*n_kv + k] = -<span class="typ">INFINITY</span>; <span class="kw">continue</span>; }
+            <span class="kw">if</span> (kp &gt; qp)                  { mask[q*n_kv + k] = -<span class="typ">INFINITY</span>; <span class="kw">continue</span>; }
+            <span class="kw">if</span> <span class="kw">constexpr</span> (swa) {
+                <span class="kw">if</span> (kp &lt; qp - <span class="kw">int</span>(n_swa)) { mask[q*n_kv + k] = -<span class="typ">INFINITY</span>; <span class="kw">continue</span>; }
+            }
+
+            mask[q*n_kv + k] = <span class="kw">constexpr</span> (alibi) ? alibi_bias(qp - kp) : <span class="num">0.0f</span>;
+        }
+    }
+}</pre>
+
+  <p>Note that the outer iteration is over <code>cells.used</code>, the derived set of non-empty slots. The empty slots have their mask entries pre-filled with <em>-∞</em> elsewhere and are not revisited; the inner loop never has to handle them. This is what makes the cost of building the mask scale with the <em>occupied</em> portion of the cache rather than its total size.</p>
+
+  <h2 data-section="§ 6.4">A cache that helps</h2>
+
+  <p>One observation worth surfacing. Two query tokens belonging to the same sequence and adjacent in position have <em>almost</em> identical masks: only the cells at the boundary of their respective causal frontiers differ. The implementation exploits this. For consecutive ubatch tokens with the same sequence, it copies the previous query's mask row and edits only the entries that have to change. Over a long ubatch, this saves a substantial fraction of the per-token work, especially for SWA configurations where the inner loop is tight.</p>
+
+  <aside class="margin">
+    <span class="ref">§ 6.4 — perf</span>
+    A mask for a 32k context and a 256-token ubatch is an 8M-entry float array. Building it once is fine; building it from scratch for every layer would dominate the decode loop. So it is built once per forward pass and reused across all attention layers.
+  </aside>
+
+  <h2 data-section="§ 6.5">ALiBi and 2-D positions</h2>
+
+  <p>The default mask entry is zero — the slot is admissible, with no additive bias. Two model families ask for more.</p>
+
+  <p><strong>ALiBi</strong> models replace the zero with a small negative number proportional to the distance <em>(qp - kp)</em>. The proportionality constant is per-head and is one of the model's hyperparameters. The effect is that attention falls off smoothly with distance, without an explicit window. The mask becomes a graded admissibility, not a binary one.</p>
+
+  <p><strong>M-RoPE / 2-D positions</strong> models cache a (row, column) pair per cell, in the <code>ext</code> field we mentioned in <a href="03-cells.html">Chapter III</a>. The mask builder consults both coordinates when evaluating distance, and the SWA predicate becomes a 2-D box rather than a 1-D interval. This is rare in pure text models but central in some multimodal architectures, where the cache must represent image patches arranged in space as well as tokens arranged in time.</p>
+
+  <h2 data-section="§ 6.6">What the mask does not do</h2>
+
+  <p>It is worth stating what the mask is <em>not</em>. It is not the only thing that limits which slots an attention can use: the <code>cells.used</code> set already excludes the empty ones, so the mask never needs to declare them inadmissible. It is not the place where eviction decisions are made: that happens elsewhere, by <code>seq_rm</code> or by SWA-aware allocation. And it is not where prefix sharing is implemented: shared cells appear in the mask once, with multiple sequences eligible to attend, and the mask predicate handles each sequence's perspective independently.</p>
+
+  <p>The mask is the moment, in each forward pass, when the cache's accumulated bookkeeping meets the math. Every careful invariant the cache has maintained — every shift, every fork, every sliding window — collapses into a single dense matrix of zeros and infinities. Then the softmax does the rest.</p>
+
+  <p>We now have the full vocabulary. The remaining two chapters describe the operations on the cache — the lifecycle of a forward pass and the seq_* family — and the recent additions worth knowing about: quantized KV, multi-token prediction, hybrid memory.</p>
+
+  <nav class="footer-nav">
+    <a href="05-iswa.html" class="prev">
+      <span class="label">Chapter V</span>
+      <span class="ttl">Two Caches, Interleaved</span>
+    </a>
+    <a href="07-operations.html" class="next">
+      <span class="label">Chapter VII</span>
+      <span class="ttl">The Lifecycle of an Operation</span>
+    </a>
+  </nav>
+
+</article>
+
+</body>
+</html>

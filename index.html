@@ -2,757 +2,668 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>The Importance Matrix — a note on activation-weighted quantization</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT,WONK@9..144,300..900,0..100,0..1&family=Newsreader:opsz,ital,wght@6..72,0,200..800;6..72,1,200..800&family=JetBrains+Mono:wght@300..700&display=swap">
+<title>Notes on llama.cpp — An Engineering Library</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT@9..144,300..900,0..100&family=Newsreader:ital,opsz,wght@0,6..72,200..800;1,6..72,200..800&family=JetBrains+Mono:wght@300..700&display=swap" rel="stylesheet">
 <style>
-:root {
-  --paper:        #f1ead9;
-  --paper-2:      #ebe1c8;
-  --ink:          #1a1411;
-  --ink-soft:     #4d4036;
-  --rule:         #b9a98a;
-  --rule-soft:    #d4c6a8;
-  --oxblood:      #8a2418;
-  --oxblood-deep: #5d180f;
-  --marginalia:   #756753;
+  :root {
+    --paper:       #f1e9d4;
+    --paper-2:     #e7decb;
+    --paper-3:     #ddd2b8;
+    --ink:         #1a1715;
+    --ink-soft:    #3a342c;
+    --rule:        #c8b890;
+    --rule-soft:   #d8caa8;
+    --accent:      #b73a26;
+    --accent-2:    #7a3a1c;
+    --slate:       #354152;
+    --mute:        #8d7e5c;
+    --highlight:   #f7e9a8;
+    --code-bg:     #e6dcbe;
+    --good:        #4a6b2e;
 
-  --serif:   "Newsreader", "Iowan Old Style", Palatino, Georgia, serif;
-  --display: "Fraunces", "Newsreader", Georgia, serif;
-  --mono:    "JetBrains Mono", "SF Mono", Consolas, monospace;
-}
-
-* { box-sizing: border-box; margin: 0; padding: 0; }
-
-html { font-size: 17px; }
-@media (min-width: 1100px) { html { font-size: 18px; } }
-
-body {
-  background:
-    radial-gradient(ellipse at 18% 4%, rgba(138, 36, 24, 0.05), transparent 55%),
-    radial-gradient(ellipse at 92% 70%, rgba(70, 50, 30, 0.06), transparent 65%),
-    linear-gradient(180deg, var(--paper), var(--paper-2));
-  background-attachment: fixed;
-  color: var(--ink);
-  font-family: var(--serif);
-  font-feature-settings: "kern", "liga", "onum";
-  min-height: 100vh;
-  -webkit-font-smoothing: antialiased;
-  overflow-x: hidden;
-}
-
-/* paper grain */
-body::before {
-  content: "";
-  position: fixed; inset: 0;
-  pointer-events: none;
-  z-index: 100;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.15 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
-  mix-blend-mode: multiply;
-  opacity: 0.45;
-}
-
-::selection { background: rgba(138, 36, 24, 0.22); color: var(--ink); }
-
-/* — masthead — */
-.masthead {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 2rem 2.5rem 0.85rem;
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  align-items: baseline;
-  gap: 1.5rem;
-  border-bottom: 1px solid var(--rule);
-  font-family: var(--mono);
-  font-size: 0.72rem;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--ink-soft);
-}
-.masthead .left   { text-align: left; }
-.masthead .center { color: var(--oxblood); font-weight: 500; }
-.masthead .right  { text-align: right; }
-
-/* — header — */
-.header {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 4.5rem 2.5rem 2rem;
-  position: relative;
-}
-
-.eyebrow {
-  font-family: var(--mono);
-  font-size: 0.78rem;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-  color: var(--oxblood);
-  margin-bottom: 2rem;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-.eyebrow::before {
-  content: "";
-  display: inline-block;
-  width: 1.5rem;
-  height: 1px;
-  background: var(--oxblood);
-}
-
-.title {
-  font-family: var(--display);
-  font-variation-settings: "opsz" 144, "wght" 380, "SOFT" 30;
-  font-size: clamp(3.4rem, 9vw, 7.5rem);
-  line-height: 0.92;
-  letter-spacing: -0.025em;
-  margin-bottom: 1.75rem;
-  max-width: 14ch;
-}
-.title .ital {
-  font-style: italic;
-  font-variation-settings: "opsz" 144, "wght" 360, "SOFT" 60, "WONK" 1;
-  color: var(--oxblood);
-}
-
-.dek {
-  font-family: var(--serif);
-  font-style: italic;
-  font-size: clamp(1.1rem, 1.6vw, 1.35rem);
-  line-height: 1.5;
-  color: var(--ink-soft);
-  max-width: 52ch;
-  font-variation-settings: "opsz" 18, "wght" 380;
-}
-
-.byline {
-  margin-top: 2.5rem;
-  display: flex;
-  gap: 2.5rem;
-  flex-wrap: wrap;
-  font-family: var(--mono);
-  font-size: 0.7rem;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--marginalia);
-}
-.byline span { display: block; }
-.byline strong {
-  color: var(--ink);
-  font-weight: 400;
-  display: block;
-  margin-top: 0.35rem;
-  font-family: var(--serif);
-  font-style: italic;
-  font-size: 1rem;
-  letter-spacing: 0;
-  text-transform: none;
-  font-variation-settings: "opsz" 14, "wght" 420;
-}
-
-/* — hero figure — */
-.figure {
-  max-width: 1200px;
-  margin: 3rem auto 4rem;
-  padding: 0 2.5rem;
-}
-
-.matrix-wrap {
-  background: linear-gradient(180deg, #f7f1e0 0%, #ede2c2 100%);
-  border: 1px solid var(--rule);
-  padding: 2.5rem;
-  position: relative;
-  box-shadow: 0 1px 0 rgba(0,0,0,0.04), 0 30px 60px -40px rgba(60, 30, 10, 0.25);
-}
-.matrix-wrap::before {
-  content: "";
-  position: absolute;
-  inset: 6px;
-  border: 1px solid var(--rule-soft);
-  pointer-events: none;
-}
-
-.matrix-label {
-  position: absolute;
-  font-family: var(--mono);
-  font-size: 0.7rem;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--ink-soft);
-  z-index: 2;
-}
-.matrix-label.tl { top: 1.1rem; left: 1.5rem; }
-.matrix-label.tr { top: 1.1rem; right: 1.5rem; color: var(--oxblood); font-family: var(--serif); font-style: italic; text-transform: none; letter-spacing: 0; font-size: 0.95rem; }
-.matrix-label.bl { bottom: 1.1rem; left: 1.5rem; }
-.matrix-label.br { bottom: 1.1rem; right: 1.5rem; color: var(--marginalia); }
-
-.matrix-svg {
-  display: block;
-  width: 100%;
-  height: auto;
-  margin: 1rem 0;
-}
-
-.matrix-cell {
-  opacity: 0;
-  animation: cell-in 0.6s cubic-bezier(.2,.7,.3,1) forwards;
-  transition: filter .15s;
-}
-.matrix-cell:hover { filter: brightness(0.7) saturate(1.3); }
-@keyframes cell-in {
-  from { opacity: 0; transform: translateY(-3px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-
-.figcap {
-  margin-top: 1.5rem;
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 1.5rem;
-  font-size: 0.94rem;
-  line-height: 1.55;
-  color: var(--ink-soft);
-  max-width: 60rem;
-}
-.figcap .num {
-  font-family: var(--mono);
-  font-size: 0.72rem;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--oxblood);
-  white-space: nowrap;
-  padding-top: 0.2rem;
-}
-.figcap p { font-style: italic; font-variation-settings: "opsz" 16, "wght" 380; }
-
-/* — article — */
-.article {
-  max-width: 1200px;
-  margin: 4rem auto 6rem;
-  padding: 0 2.5rem;
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 2rem;
-}
-@media (min-width: 880px) {
-  .article {
-    grid-template-columns: 13rem 1fr;
-    gap: 3.5rem;
+    --display:  'Fraunces','EB Garamond',Georgia,serif;
+    --body:     'Newsreader','EB Garamond',Georgia,serif;
+    --mono:     'JetBrains Mono','IBM Plex Mono','Menlo',monospace;
   }
-}
-
-.aside .toc {
-  position: sticky;
-  top: 2rem;
-  font-family: var(--mono);
-  font-size: 0.74rem;
-  letter-spacing: 0.08em;
-  line-height: 1.6;
-  padding-top: 0.5rem;
-  border-top: 1px solid var(--rule);
-}
-.aside .toc h4 {
-  font-family: var(--mono);
-  font-size: 0.68rem;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-  color: var(--ink-soft);
-  margin-bottom: 1.1rem;
-  font-weight: 500;
-}
-.aside .toc a {
-  display: grid;
-  grid-template-columns: 1.6rem 1fr;
-  align-items: baseline;
-  color: var(--marginalia);
-  text-decoration: none;
-  padding: 0.35rem 0;
-  border-bottom: 1px dotted transparent;
-  transition: color .2s, border-color .2s, transform .2s;
-}
-.aside .toc a:hover,
-.aside .toc a.active {
-  color: var(--oxblood);
-  transform: translateX(2px);
-}
-.aside .toc a.active { border-bottom-color: var(--rule); }
-.aside .toc .roman {
-  color: var(--oxblood);
-  font-family: var(--display);
-  font-style: italic;
-  font-variation-settings: "opsz" 14, "wght" 500;
-  font-size: 0.95rem;
-  letter-spacing: 0;
-  text-transform: lowercase;
-}
-
-.body { max-width: 38rem; }
-
-.body section { margin-bottom: 3.5rem; position: relative; }
-
-.body h2 {
-  font-family: var(--display);
-  font-variation-settings: "opsz" 36, "wght" 450;
-  font-size: 1.9rem;
-  line-height: 1.15;
-  letter-spacing: -0.015em;
-  margin-bottom: 1.25rem;
-  display: flex;
-  align-items: baseline;
-  gap: 0.9rem;
-  scroll-margin-top: 2rem;
-}
-.body h2 .num {
-  font-family: var(--mono);
-  font-size: 0.74rem;
-  letter-spacing: 0.18em;
-  color: var(--oxblood);
-  font-variation-settings: normal;
-}
-
-.body p {
-  font-family: var(--serif);
-  font-variation-settings: "opsz" 18, "wght" 380;
-  font-size: 1.0625rem;
-  line-height: 1.62;
-  margin-bottom: 1.1rem;
-  color: var(--ink);
-  text-wrap: pretty;
-  hanging-punctuation: first;
-}
-
-.body p.lede::first-letter {
-  font-family: var(--display);
-  font-variation-settings: "opsz" 144, "wght" 500, "SOFT" 30;
-  font-size: 5.2rem;
-  line-height: 0.82;
-  float: left;
-  padding: 0.45rem 0.55rem 0 0;
-  color: var(--oxblood);
-}
-
-.body em { font-style: italic; font-variation-settings: "opsz" 18, "wght" 380; }
-.body strong { font-variation-settings: "opsz" 18, "wght" 580; color: var(--ink); }
-
-/* display equation */
-.eq {
-  display: block;
-  margin: 1.5rem 0;
-  padding: 1.25rem 5rem 1.25rem 1.5rem;
-  background: rgba(138, 36, 24, 0.04);
-  border-left: 2px solid var(--oxblood);
-  font-family: var(--serif);
-  font-style: italic;
-  font-size: 1.15rem;
-  font-variation-settings: "opsz" 24, "wght" 380;
-  line-height: 1.5;
-  position: relative;
-}
-.eq .lbl {
-  position: absolute;
-  right: 1rem;
-  bottom: 0.85rem;
-  font-family: var(--mono);
-  font-style: normal;
-  font-size: 0.7rem;
-  letter-spacing: 0.14em;
-  color: var(--marginalia);
-  text-transform: uppercase;
-}
-.eq sub, .eq sup { font-size: 0.68em; line-height: 0; }
-
-/* code */
-pre {
-  background: #18120f;
-  color: #ebe1c8;
-  padding: 1.25rem 1.5rem;
-  margin: 1.5rem 0;
-  font-family: var(--mono);
-  font-size: 0.82rem;
-  line-height: 1.7;
-  overflow-x: auto;
-  border-left: 2px solid var(--oxblood);
-  font-weight: 400;
-}
-pre .c { color: #857c6a; font-style: italic; }
-pre .k { color: #d68a5c; }
-pre .s { color: #c5a872; }
-pre .n { color: #d1a98a; }
-pre .f { color: #ebe1c8; font-weight: 500; }
-
-code.inl {
-  font-family: var(--mono);
-  font-size: 0.86em;
-  background: rgba(138, 36, 24, 0.08);
-  padding: 0.08em 0.42em;
-  border-radius: 2px;
-  color: var(--oxblood-deep);
-  white-space: nowrap;
-}
-
-/* marginalia */
-.note {
-  display: block;
-  margin: 1rem 0;
-  padding-left: 1rem;
-  border-left: 1px solid var(--rule);
-  font-family: var(--serif);
-  font-style: italic;
-  font-variation-settings: "opsz" 12, "wght" 380;
-  font-size: 0.86rem;
-  line-height: 1.5;
-  color: var(--marginalia);
-}
-.note .marker {
-  font-family: var(--display);
-  font-style: italic;
-  color: var(--oxblood);
-  font-size: 0.95rem;
-  margin-right: 0.4rem;
-  font-variation-settings: "opsz" 12, "wght" 500;
-}
-@media (min-width: 1240px) {
-  .note {
-    position: absolute;
-    left: calc(100% + 2.5rem);
-    width: 13.5rem;
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
     margin: 0;
-    border-left: none;
-    padding-left: 0;
-    padding-top: 0.45rem;
-    border-top: 1px solid var(--rule);
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 18px;
+    line-height: 1.62;
+    font-feature-settings: "kern","liga","onum";
+    background-image:
+      radial-gradient(ellipse 80% 60% at 10% 0%, rgba(255,255,255,.45) 0%, transparent 60%),
+      radial-gradient(ellipse 60% 50% at 100% 100%, rgba(120,90,40,.06) 0%, transparent 60%),
+      repeating-linear-gradient(0deg, transparent 0, transparent 2px, rgba(50,30,10,.012) 2px, rgba(50,30,10,.012) 3px);
   }
-}
 
-/* tiny bar chart */
-.chart {
-  margin: 1.5rem 0 1.75rem;
-  font-family: var(--mono);
-  font-size: 0.78rem;
-}
-.chart .row {
-  display: grid;
-  grid-template-columns: 5.5rem 1fr 4rem;
-  align-items: center;
-  gap: 0.85rem;
-  padding: 0.5rem 0;
-  border-bottom: 1px dotted var(--rule);
-}
-.chart .row:last-child { border-bottom: 0; }
-.chart .name { color: var(--ink-soft); letter-spacing: 0.06em; }
-.chart .bar {
-  height: 9px;
-  background: rgba(0,0,0,0.04);
-  position: relative;
-  overflow: hidden;
-  border: 1px solid var(--rule-soft);
-}
-.chart .bar::after {
-  content: "";
-  position: absolute;
-  left: 0; top: 0; bottom: 0;
-  background: linear-gradient(90deg, var(--oxblood), var(--oxblood-deep));
-  width: 0;
-  animation: bar-in 1.4s cubic-bezier(.2,.7,.2,1) forwards;
-  animation-delay: var(--d, 0s);
-}
-@keyframes bar-in { to { width: var(--w, 50%); } }
-.chart .val { color: var(--oxblood); text-align: right; font-variant-numeric: tabular-nums; }
+  /* ---- topline strip ---- */
+  .strip {
+    border-bottom: 1px solid var(--ink);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+  }
+  .strip .inner {
+    max-width: 64rem;
+    margin: 0 auto;
+    padding: 0.85rem 2rem;
+    display: flex; justify-content: space-between; align-items: baseline; gap: 1rem;
+  }
+  .strip .left { color: var(--accent); font-weight: 600; }
 
-/* ornament */
-.ornament-rule {
-  margin: 3.5rem 0;
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  align-items: center;
-  gap: 1rem;
-}
-.ornament-rule::before, .ornament-rule::after {
-  content: "";
-  height: 1px;
-  background: var(--rule);
-}
-.ornament-rule span {
-  font-family: var(--display);
-  font-style: italic;
-  font-variation-settings: "opsz" 24, "wght" 500;
-  font-size: 1.1rem;
-  color: var(--oxblood);
-}
+  /* ---- cover ---- */
+  .cover {
+    max-width: 64rem;
+    margin: 0 auto;
+    padding: 6rem 2rem 2rem;
+    position: relative;
+  }
+  .cover-eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 2.5rem;
+  }
+  .cover-title {
+    font-family: var(--display);
+    font-weight: 400;
+    font-size: clamp(3.6rem, 11vw, 8.5rem);
+    line-height: 0.88;
+    letter-spacing: -0.035em;
+    margin: 0;
+    font-variation-settings: "opsz" 144, "SOFT" 30;
+  }
+  .cover-title em {
+    font-style: italic;
+    font-weight: 300;
+    color: var(--accent);
+    font-variation-settings: "opsz" 144, "SOFT" 100;
+  }
+  .cover-sub {
+    font-family: var(--display);
+    font-style: italic;
+    font-weight: 300;
+    font-size: clamp(1.3rem, 2.4vw, 1.7rem);
+    color: var(--ink-soft);
+    max-width: 42rem;
+    margin: 2rem 0 0;
+    line-height: 1.4;
+    font-variation-settings: "opsz" 72, "SOFT" 100;
+  }
+  .cover-meta {
+    margin-top: 3.5rem;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1rem;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--ink);
+  }
+  .cover-meta .k { color: var(--mute); display: block; margin-bottom: 0.3rem; }
+  .cover-meta .v { color: var(--ink); }
 
-/* footer */
-.colophon {
-  max-width: 1200px;
-  margin: 6rem auto 4rem;
-  padding: 2rem 2.5rem;
-  border-top: 1px solid var(--rule);
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 2rem;
-  align-items: end;
-  font-family: var(--mono);
-  font-size: 0.7rem;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--marginalia);
-}
-.colophon .credit {
-  font-family: var(--serif);
-  font-style: italic;
-  font-size: 0.94rem;
-  letter-spacing: 0;
-  text-transform: none;
-  line-height: 1.55;
-  color: var(--ink-soft);
-  max-width: 36rem;
-  font-variation-settings: "opsz" 14, "wght" 380;
-}
+  /* ---- catalogue ---- */
+  .catalogue {
+    max-width: 64rem;
+    margin: 4rem auto 0;
+    padding: 0 2rem 6rem;
+  }
+  .catalogue-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--ink);
+    padding-bottom: 0.6rem;
+    display: flex; justify-content: space-between;
+  }
 
-/* small */
-@media (max-width: 720px) {
-  .masthead { grid-template-columns: 1fr; text-align: left; gap: 0.2rem; padding: 1.25rem 1.5rem 0.5rem; }
-  .masthead .center, .masthead .right { text-align: left; }
-  .header  { padding: 2.5rem 1.5rem 1.5rem; }
-  .figure  { padding: 0 1.5rem; }
-  .matrix-wrap { padding: 2rem 1.25rem 1.25rem; }
-  .matrix-label { font-size: 0.62rem; }
-  .article { padding: 0 1.5rem; }
-  .colophon { padding: 2rem 1.5rem; grid-template-columns: 1fr; }
-  .eq { padding-right: 1.5rem; }
-  .eq .lbl { position: static; display: block; margin-top: 0.5rem; }
-}
+  .works {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    counter-reset: w;
+  }
+  .works > li {
+    counter-increment: w;
+    padding: 2.4rem 0;
+    border-bottom: 1px solid var(--rule);
+    display: grid;
+    grid-template-columns: 12rem 1fr auto;
+    column-gap: 2.5rem;
+    align-items: start;
+  }
+  .works > li:last-child { border-bottom: 1px solid var(--ink); }
+
+  .works .glyph {
+    display: block;
+    border: 1px solid var(--ink);
+    background: var(--paper-2);
+    aspect-ratio: 4 / 3;
+    overflow: hidden;
+    position: relative;
+  }
+  .works .glyph svg { width: 100%; height: 100%; display: block; }
+
+  .works .body { min-width: 0; }
+  .works .kicker {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--mute);
+    margin-bottom: 0.4rem;
+  }
+  .works .kicker .num { color: var(--accent); margin-right: 0.5rem; }
+  .works h2 {
+    font-family: var(--display);
+    font-weight: 400;
+    font-size: 2rem;
+    line-height: 1.05;
+    margin: 0 0 0.5rem;
+    color: var(--ink);
+    font-variation-settings: "opsz" 80;
+    letter-spacing: -0.012em;
+  }
+  .works h2 em {
+    font-style: italic;
+    font-weight: 300;
+    color: var(--accent);
+    font-variation-settings: "opsz" 80, "SOFT" 100;
+  }
+  .works .blurb {
+    margin: 0 0 0.8rem;
+    color: var(--ink-soft);
+    font-size: 1.02rem;
+    line-height: 1.5;
+    max-width: 34rem;
+  }
+  .works .ttls {
+    list-style: none;
+    padding: 0;
+    margin: 0.4rem 0 0;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: var(--ink-soft);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1rem;
+  }
+  .works .ttls li::before {
+    content: '§';
+    color: var(--accent);
+    margin-right: 0.4rem;
+  }
+
+  .works .right {
+    text-align: right;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--mute);
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.4rem;
+  }
+  .works .right .pg { color: var(--accent); }
+  .works .read {
+    font-family: var(--display);
+    font-style: italic;
+    font-size: 1.15rem;
+    font-weight: 400;
+    color: var(--accent);
+    text-transform: none;
+    letter-spacing: 0;
+    text-decoration: none;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 1px;
+    transition: border-color 120ms;
+  }
+  .works .read:hover { border-bottom-color: var(--accent); }
+  .works .read::after { content: ' →'; }
+
+  /* whole row clickable */
+  .works > li {
+    cursor: pointer;
+    transition: background 120ms;
+  }
+  .works > li:hover { background: rgba(247,233,168,.18); }
+  .works > li:hover h2 { color: var(--accent); }
+  .works .body a.title-link {
+    color: inherit;
+    text-decoration: none;
+    border: none;
+  }
+
+  /* ---- colophon ---- */
+  .colophon {
+    max-width: 64rem;
+    margin: 0 auto 6rem;
+    padding: 0 2rem;
+    font-family: var(--body);
+    font-style: italic;
+    color: var(--ink-soft);
+    font-size: 1.02rem;
+    max-width: 44rem;
+  }
+  .colophon code {
+    font-family: var(--mono);
+    font-size: 0.86em;
+    background: var(--code-bg);
+    padding: 0.05em 0.3em;
+    border-radius: 2px;
+    font-style: normal;
+  }
+
+  /* ---- responsive ---- */
+  @media (max-width: 760px) {
+    .works > li {
+      grid-template-columns: 1fr;
+      gap: 1rem;
+    }
+    .works .glyph { aspect-ratio: 16 / 7; }
+    .works .right {
+      flex-direction: row;
+      text-align: left;
+      align-items: baseline;
+      gap: 1rem;
+    }
+    .cover-meta { grid-template-columns: repeat(2, 1fr); gap: 1.5rem; }
+    body { font-size: 16px; }
+  }
+
+  /* ---- animations ---- */
+  @keyframes fadeUp { from{opacity:0;transform:translateY(8px);} to{opacity:1;transform:translateY(0);} }
+  .fade-up { animation: fadeUp 600ms cubic-bezier(.22,1,.36,1) both; }
+  .fade-up.d1{animation-delay:80ms;} .fade-up.d2{animation-delay:160ms;}
+  .fade-up.d3{animation-delay:240ms;} .fade-up.d4{animation-delay:320ms;}
 </style>
 </head>
 <body>
 
-<header class="masthead">
-  <div class="left">Vol. iv &middot; No. 7</div>
-  <div class="center">— a study in low-bit allocation —</div>
-  <div class="right">folio 01 &middot; 2026</div>
-</header>
+<div class="strip">
+  <div class="inner">
+    <span class="left">An Engineering Library</span>
+    <span>llama.cpp · gemma4-mtp</span>
+  </div>
+</div>
 
-<section class="header">
-  <div class="eyebrow">A note on activation-weighted quantization</div>
-  <h1 class="title">The <span class="ital">Importance</span> Matrix</h1>
-  <p class="dek">A small file, derived from a few hundred thousand tokens, that tells a quantizer where to spend its bits — and where it can afford not to.</p>
+<!-- ============================================================ -->
+<!--                            COVER                              -->
+<!-- ============================================================ -->
+<section class="cover">
+  <div class="cover-eyebrow fade-up">Four short monographs, one codebase</div>
 
-  <div class="byline">
-    <span>Subject<strong>llama.cpp &middot; imatrix</strong></span>
-    <span>Family<strong>GGUF, k-quants, IQ-quants</strong></span>
-    <span>Read<strong>Twelve minutes</strong></span>
+  <h1 class="cover-title fade-up d1">
+    Notes on<br>
+    <em>llama.cpp</em>.
+  </h1>
+
+  <p class="cover-sub fade-up d2">
+    A small library of engineering notes on the parts of the inference runtime
+    that turned out to deserve a careful look — the caches that shape memory,
+    the matrix that shapes quantization, and the bookkeeping that ties them
+    to a streaming decode.
+  </p>
+
+  <div class="cover-meta fade-up d4">
+    <div class="item"><span class="k">Works</span><span class="v">Four</span></div>
+    <div class="item"><span class="k">Source</span><span class="v">llama.cpp tree</span></div>
+    <div class="item"><span class="k">Branch</span><span class="v">gemma4-mtp</span></div>
+    <div class="item"><span class="k">Audience</span><span class="v">Implementers</span></div>
   </div>
 </section>
 
-<figure class="figure">
-  <div class="matrix-wrap">
-    <span class="matrix-label tl">Fig. 1</span>
-    <span class="matrix-label tr">E[ xᵢ² ]</span>
-    <span class="matrix-label bl">channel &middot; 0 → 47</span>
-    <span class="matrix-label br">block 21 &middot; ffn_down</span>
-
-    <svg class="matrix-svg" viewBox="0 0 960 360" preserveAspectRatio="none" id="mx"></svg>
+<!-- ============================================================ -->
+<!--                        CATALOGUE                              -->
+<!-- ============================================================ -->
+<section class="catalogue">
+  <div class="catalogue-label">
+    <span>Catalogue</span>
+    <span>I — IV</span>
   </div>
-  <figcaption class="figcap">
-    <span class="num">Fig. 1 →</span>
-    <p>A single row of the importance matrix, visualized for one feed-forward projection. Each cell is one input channel; saturation tracks the mean squared activation gathered over the calibration corpus. The bright clusters are the channels a 4-bit quantizer will be told to treat with care; the pale field is what it is permitted to round.</p>
-  </figcaption>
-</figure>
 
-<article class="article">
+  <ol class="works">
 
-<aside class="aside">
-  <nav class="toc">
-    <h4>Contents</h4>
-    <a href="#problem"><span class="roman">i.</span><span>The Allocation</span></a>
-    <a href="#definition"><span class="roman">ii.</span><span>A definition</span></a>
-    <a href="#compute"><span class="roman">iii.</span><span>How it is gathered</span></a>
-    <a href="#use"><span class="roman">iv.</span><span>Where it enters</span></a>
-    <a href="#empirical"><span class="roman">v.</span><span>What it buys</span></a>
-    <a href="#caveats"><span class="roman">vi.</span><span>Failure modes</span></a>
-  </nav>
-</aside>
+    <!-- ====== I. KV Cache ====== -->
+    <li onclick="location.href='kv-cache-explainer/index.html'">
+      <div class="glyph" aria-hidden="true">
+        <svg viewBox="0 0 200 150" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <pattern id="gx-i" width="14" height="14" patternUnits="userSpaceOnUse">
+              <rect width="14" height="14" fill="none" stroke="#1a1715" stroke-width="0.4"/>
+            </pattern>
+          </defs>
+          <rect width="200" height="150" fill="#e7decb"/>
+          <rect x="10" y="10" width="180" height="130" fill="url(#gx-i)"/>
+          <!-- two filled streams -->
+          <g fill="#b73a26" opacity="0.85">
+            <rect x="10" y="10" width="14" height="14"/>
+            <rect x="24" y="10" width="14" height="14"/>
+            <rect x="38" y="10" width="14" height="14"/>
+            <rect x="52" y="10" width="14" height="14"/>
+            <rect x="66" y="10" width="14" height="14"/>
+            <rect x="80" y="10" width="14" height="14"/>
+            <rect x="94" y="10" width="14" height="14"/>
+            <rect x="108" y="10" width="14" height="14"/>
+          </g>
+          <g fill="#354152" opacity="0.7">
+            <rect x="10" y="24" width="14" height="14"/>
+            <rect x="24" y="24" width="14" height="14"/>
+            <rect x="38" y="24" width="14" height="14"/>
+            <rect x="52" y="24" width="14" height="14"/>
+            <rect x="66" y="24" width="14" height="14"/>
+          </g>
+          <g fill="#7a3a1c" opacity="0.55">
+            <rect x="10" y="38" width="14" height="14"/>
+            <rect x="24" y="38" width="14" height="14"/>
+            <rect x="38" y="38" width="14" height="14"/>
+          </g>
+          <g fill="#4a6b2e" opacity="0.6">
+            <rect x="10" y="52" width="14" height="14"/>
+            <rect x="24" y="52" width="14" height="14"/>
+          </g>
+        </svg>
+      </div>
 
-<div class="body">
+      <div class="body">
+        <div class="kicker"><span class="num">I.</span>Eight chapters · ~110 KB</div>
+        <a class="title-link" href="kv-cache-explainer/index.html">
+          <h2>The <em>KV</em> Cache</h2>
+        </a>
+        <p class="blurb">
+          A bound-volume reference on the unified attention cache: why it exists, the layout in
+          memory, the lattice of cells and streams, the mask, and the lifecycle of one operation
+          from <code>find_slot</code> to <code>apply_ubatch</code>.
+        </p>
+        <ul class="ttls">
+          <li>Why cache</li>
+          <li>Layout</li>
+          <li>Cells</li>
+          <li>Streams</li>
+          <li>ISWA</li>
+          <li>Mask</li>
+          <li>Lifecycle</li>
+          <li>Quantization</li>
+        </ul>
+      </div>
 
-<section id="problem">
-<h2><span class="num">i.</span> The Allocation</h2>
-<p class="lede"><strong>Quantization is a budget problem.</strong> A seven-billion-parameter model has seven billion places where precision can be spent; a Q4_K_M file gives the encoder roughly four bits per parameter to spend. The encoder must decide, weight by weight, how to round. A uniform scheme treats every parameter as equally consequential — but a forward pass through a transformer does not. Some channels carry signal that dominates the next layer's pre-activation; others carry whispers. Squashing a loud channel onto the same coarse grid as a quiet one wastes resolution where it would have done the most good.</p>
+      <div class="right">
+        <span class="pg">Vol. I</span>
+        <a class="read" href="kv-cache-explainer/index.html" onclick="event.stopPropagation()">Read</a>
+      </div>
+    </li>
 
-<p>The importance matrix — written <code class="inl">imatrix.dat</code> on disk — is the encoder's hint. For every linear projection in the network, it records a single number per input channel: how much that channel <em>actually moved</em> when the model was shown real text. The quantizer reads this hint and biases its grid toward the channels that mattered.</p>
+    <!-- ====== II. Recurrent Cache ====== -->
+    <li onclick="location.href='recurrent-cache.html'">
+      <div class="glyph" aria-hidden="true">
+        <svg viewBox="0 0 200 150" xmlns="http://www.w3.org/2000/svg">
+          <rect width="200" height="150" fill="#e7decb"/>
+          <!-- stacked snapshot planes -->
+          <g stroke="#1a1715" stroke-width="0.9">
+            <rect x="50" y="22" width="120" height="20" fill="#d5c9a4" opacity="0.55"/>
+            <rect x="42" y="48" width="120" height="20" fill="#d5c9a4" opacity="0.7"/>
+            <rect x="34" y="74" width="120" height="20" fill="#d5c9a4" opacity="0.85"/>
+            <rect x="26" y="100" width="120" height="22" fill="#d8c8a0"/>
+          </g>
+          <!-- internal slot divisions on the live plane -->
+          <g stroke="#1a1715" stroke-opacity="0.35" stroke-width="0.5">
+            <line x1="56" y1="100" x2="56" y2="122"/>
+            <line x1="86" y1="100" x2="86" y2="122"/>
+            <line x1="116" y1="100" x2="116" y2="122"/>
+          </g>
+          <!-- back-arrow into the past -->
+          <g fill="none" stroke="#b73a26" stroke-width="1.4">
+            <path d="M 175 110 C 185 80, 185 50, 175 30"/>
+            <polygon points="175,28 170,38 180,38" fill="#b73a26" stroke="none"/>
+          </g>
+          <text x="158" y="135" font-family="JetBrains Mono, monospace" font-size="8" fill="#3a342c" letter-spacing="0.1em">live</text>
+        </svg>
+      </div>
 
-<aside class="note"><span class="marker">¶</span>In practice the file is small — a few megabytes — even for a 70B model. It is metadata, not weights.</aside>
+      <div class="body">
+        <div class="kicker"><span class="num">II.</span>One monograph · interactive · ~57 KB</div>
+        <a class="title-link" href="recurrent-cache.html">
+          <h2>The <em>Recurrent</em> Cache &amp; Slot Rollback</h2>
+        </a>
+        <p class="blurb">
+          The other cache — one slot per sequence, not per token. A study of the snapshot
+          planes that let speculative decoding walk a state-space model backwards, and the
+          per-seq <code>rs_idx</code> that addresses them.
+        </p>
+        <ul class="ttls">
+          <li>mem_cell</li>
+          <li>Snapshot planes</li>
+          <li>find_slot gather</li>
+          <li>Rollback semantics</li>
+          <li>s_copy formula</li>
+          <li>rs_z zero plane</li>
+        </ul>
+      </div>
+
+      <div class="right">
+        <span class="pg">Vol. II</span>
+        <a class="read" href="recurrent-cache.html" onclick="event.stopPropagation()">Read</a>
+      </div>
+    </li>
+
+    <!-- ====== III. KV Sharing ====== -->
+    <li onclick="location.href='kv-sharing.html'">
+      <div class="glyph" aria-hidden="true">
+        <svg viewBox="0 0 200 150" xmlns="http://www.w3.org/2000/svg">
+          <rect width="200" height="150" fill="#e7decb"/>
+          <!-- trunk: 60 stacked layers -->
+          <g fill="#354152" opacity="0.85">
+            <rect x="20" y="14" width="14" height="120"/>
+          </g>
+          <g fill="#1a1715" opacity="0.18">
+            <g>
+              <line x1="20" y1="20" x2="34" y2="20" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="28" x2="34" y2="28" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="36" x2="34" y2="36" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="44" x2="34" y2="44" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="52" x2="34" y2="52" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="60" x2="34" y2="60" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="68" x2="34" y2="68" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="76" x2="34" y2="76" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="84" x2="34" y2="84" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="92" x2="34" y2="92" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="100" x2="34" y2="100" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="108" x2="34" y2="108" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="116" x2="34" y2="116" stroke="#f1e9d4" stroke-width="0.5"/>
+              <line x1="20" y1="124" x2="34" y2="124" stroke="#f1e9d4" stroke-width="0.5"/>
+            </g>
+          </g>
+          <!-- arrows: 4 MTP heads sharing -->
+          <g stroke="#b73a26" stroke-width="1.3" fill="none">
+            <path d="M 34 30 L 110 30"/>
+            <path d="M 34 55 L 110 55"/>
+            <path d="M 34 80 L 110 80"/>
+            <path d="M 34 105 L 110 105"/>
+          </g>
+          <g fill="#b73a26">
+            <polygon points="110,30 104,26 104,34"/>
+            <polygon points="110,55 104,51 104,59"/>
+            <polygon points="110,80 104,76 104,84"/>
+            <polygon points="110,105 104,101 104,109"/>
+          </g>
+          <!-- MTP blocks -->
+          <g fill="#b73a26" opacity="0.9">
+            <rect x="115" y="22" width="60" height="16"/>
+            <rect x="115" y="47" width="60" height="16"/>
+            <rect x="115" y="72" width="60" height="16"/>
+            <rect x="115" y="97" width="60" height="16"/>
+          </g>
+          <g font-family="JetBrains Mono, monospace" font-size="8" fill="#f1e9d4">
+            <text x="125" y="33" letter-spacing="0.08em">mtp 0</text>
+            <text x="125" y="58" letter-spacing="0.08em">mtp 1</text>
+            <text x="125" y="83" letter-spacing="0.08em">mtp 2</text>
+            <text x="125" y="108" letter-spacing="0.08em">mtp 3</text>
+          </g>
+        </svg>
+      </div>
+
+      <div class="body">
+        <div class="kicker"><span class="num">III.</span>One essay · ~28 KB</div>
+        <a class="title-link" href="kv-sharing.html">
+          <h2>Gemma 4 MTP &mdash; <em>sharing</em> the trunk cache</h2>
+        </a>
+        <p class="blurb">
+          How the four MTP heads of Gemma 4 reuse the 60-layer main model's KV cache
+          rather than computing their own, and the bookkeeping that keeps the shared
+          state honest across speculative draft &amp; verify cycles.
+        </p>
+        <ul class="ttls">
+          <li>Layer reuse</li>
+          <li>Stream layout</li>
+          <li>MTP heads</li>
+          <li>Speculative decode</li>
+        </ul>
+      </div>
+
+      <div class="right">
+        <span class="pg">Vol. III</span>
+        <a class="read" href="kv-sharing.html" onclick="event.stopPropagation()">Read</a>
+      </div>
+    </li>
+
+    <!-- ====== IV. Importance Matrix ====== -->
+    <li onclick="location.href='imatrix.html'">
+      <div class="glyph" aria-hidden="true">
+        <svg viewBox="0 0 200 150" xmlns="http://www.w3.org/2000/svg">
+          <rect width="200" height="150" fill="#e7decb"/>
+          <!-- importance heatmap -->
+          <g>
+            <rect x="20" y="22" width="14" height="14" fill="rgba(183,58,38,0.85)"/>
+            <rect x="34" y="22" width="14" height="14" fill="rgba(183,58,38,0.40)"/>
+            <rect x="48" y="22" width="14" height="14" fill="rgba(183,58,38,0.65)"/>
+            <rect x="62" y="22" width="14" height="14" fill="rgba(183,58,38,0.25)"/>
+            <rect x="76" y="22" width="14" height="14" fill="rgba(183,58,38,0.50)"/>
+            <rect x="90" y="22" width="14" height="14" fill="rgba(183,58,38,0.75)"/>
+            <rect x="104" y="22" width="14" height="14" fill="rgba(183,58,38,0.20)"/>
+            <rect x="118" y="22" width="14" height="14" fill="rgba(183,58,38,0.55)"/>
+            <rect x="132" y="22" width="14" height="14" fill="rgba(183,58,38,0.70)"/>
+            <rect x="146" y="22" width="14" height="14" fill="rgba(183,58,38,0.35)"/>
+            <rect x="160" y="22" width="14" height="14" fill="rgba(183,58,38,0.45)"/>
+
+            <rect x="20" y="36" width="14" height="14" fill="rgba(183,58,38,0.30)"/>
+            <rect x="34" y="36" width="14" height="14" fill="rgba(183,58,38,0.70)"/>
+            <rect x="48" y="36" width="14" height="14" fill="rgba(183,58,38,0.55)"/>
+            <rect x="62" y="36" width="14" height="14" fill="rgba(183,58,38,0.80)"/>
+            <rect x="76" y="36" width="14" height="14" fill="rgba(183,58,38,0.40)"/>
+            <rect x="90" y="36" width="14" height="14" fill="rgba(183,58,38,0.20)"/>
+            <rect x="104" y="36" width="14" height="14" fill="rgba(183,58,38,0.60)"/>
+            <rect x="118" y="36" width="14" height="14" fill="rgba(183,58,38,0.85)"/>
+            <rect x="132" y="36" width="14" height="14" fill="rgba(183,58,38,0.30)"/>
+            <rect x="146" y="36" width="14" height="14" fill="rgba(183,58,38,0.65)"/>
+            <rect x="160" y="36" width="14" height="14" fill="rgba(183,58,38,0.50)"/>
+
+            <rect x="20" y="50" width="14" height="14" fill="rgba(183,58,38,0.50)"/>
+            <rect x="34" y="50" width="14" height="14" fill="rgba(183,58,38,0.25)"/>
+            <rect x="48" y="50" width="14" height="14" fill="rgba(183,58,38,0.75)"/>
+            <rect x="62" y="50" width="14" height="14" fill="rgba(183,58,38,0.45)"/>
+            <rect x="76" y="50" width="14" height="14" fill="rgba(183,58,38,0.65)"/>
+            <rect x="90" y="50" width="14" height="14" fill="rgba(183,58,38,0.35)"/>
+            <rect x="104" y="50" width="14" height="14" fill="rgba(183,58,38,0.80)"/>
+            <rect x="118" y="50" width="14" height="14" fill="rgba(183,58,38,0.55)"/>
+            <rect x="132" y="50" width="14" height="14" fill="rgba(183,58,38,0.20)"/>
+            <rect x="146" y="50" width="14" height="14" fill="rgba(183,58,38,0.70)"/>
+            <rect x="160" y="50" width="14" height="14" fill="rgba(183,58,38,0.40)"/>
+
+            <rect x="20" y="64" width="14" height="14" fill="rgba(183,58,38,0.70)"/>
+            <rect x="34" y="64" width="14" height="14" fill="rgba(183,58,38,0.45)"/>
+            <rect x="48" y="64" width="14" height="14" fill="rgba(183,58,38,0.25)"/>
+            <rect x="62" y="64" width="14" height="14" fill="rgba(183,58,38,0.85)"/>
+            <rect x="76" y="64" width="14" height="14" fill="rgba(183,58,38,0.55)"/>
+            <rect x="90" y="64" width="14" height="14" fill="rgba(183,58,38,0.65)"/>
+            <rect x="104" y="64" width="14" height="14" fill="rgba(183,58,38,0.30)"/>
+            <rect x="118" y="64" width="14" height="14" fill="rgba(183,58,38,0.50)"/>
+            <rect x="132" y="64" width="14" height="14" fill="rgba(183,58,38,0.75)"/>
+            <rect x="146" y="64" width="14" height="14" fill="rgba(183,58,38,0.40)"/>
+            <rect x="160" y="64" width="14" height="14" fill="rgba(183,58,38,0.60)"/>
+
+            <rect x="20" y="78" width="14" height="14" fill="rgba(183,58,38,0.45)"/>
+            <rect x="34" y="78" width="14" height="14" fill="rgba(183,58,38,0.60)"/>
+            <rect x="48" y="78" width="14" height="14" fill="rgba(183,58,38,0.35)"/>
+            <rect x="62" y="78" width="14" height="14" fill="rgba(183,58,38,0.70)"/>
+            <rect x="76" y="78" width="14" height="14" fill="rgba(183,58,38,0.20)"/>
+            <rect x="90" y="78" width="14" height="14" fill="rgba(183,58,38,0.85)"/>
+            <rect x="104" y="78" width="14" height="14" fill="rgba(183,58,38,0.50)"/>
+            <rect x="118" y="78" width="14" height="14" fill="rgba(183,58,38,0.40)"/>
+            <rect x="132" y="78" width="14" height="14" fill="rgba(183,58,38,0.65)"/>
+            <rect x="146" y="78" width="14" height="14" fill="rgba(183,58,38,0.30)"/>
+            <rect x="160" y="78" width="14" height="14" fill="rgba(183,58,38,0.75)"/>
+
+            <rect x="20" y="92" width="14" height="14" fill="rgba(183,58,38,0.35)"/>
+            <rect x="34" y="92" width="14" height="14" fill="rgba(183,58,38,0.80)"/>
+            <rect x="48" y="92" width="14" height="14" fill="rgba(183,58,38,0.50)"/>
+            <rect x="62" y="92" width="14" height="14" fill="rgba(183,58,38,0.20)"/>
+            <rect x="76" y="92" width="14" height="14" fill="rgba(183,58,38,0.65)"/>
+            <rect x="90" y="92" width="14" height="14" fill="rgba(183,58,38,0.45)"/>
+            <rect x="104" y="92" width="14" height="14" fill="rgba(183,58,38,0.55)"/>
+            <rect x="118" y="92" width="14" height="14" fill="rgba(183,58,38,0.75)"/>
+            <rect x="132" y="92" width="14" height="14" fill="rgba(183,58,38,0.30)"/>
+            <rect x="146" y="92" width="14" height="14" fill="rgba(183,58,38,0.60)"/>
+            <rect x="160" y="92" width="14" height="14" fill="rgba(183,58,38,0.40)"/>
+          </g>
+          <!-- frame -->
+          <rect x="20" y="22" width="154" height="84" fill="none" stroke="#1a1715" stroke-width="0.8"/>
+        </svg>
+      </div>
+
+      <div class="body">
+        <div class="kicker"><span class="num">IV.</span>One note · ~27 KB</div>
+        <a class="title-link" href="imatrix.html">
+          <h2>The <em>Importance</em> Matrix</h2>
+        </a>
+        <p class="blurb">
+          A short note on activation-weighted quantization: what the imatrix file
+          actually contains, how the calibration corpus shapes per-channel scales, and
+          where it makes the biggest difference at low bitwidths.
+        </p>
+        <ul class="ttls">
+          <li>Calibration</li>
+          <li>Per-channel weighting</li>
+          <li>Low-bit gains</li>
+        </ul>
+      </div>
+
+      <div class="right">
+        <span class="pg">Vol. IV</span>
+        <a class="read" href="imatrix.html" onclick="event.stopPropagation()">Read</a>
+      </div>
+    </li>
+
+  </ol>
 </section>
 
-<section id="definition">
-<h2><span class="num">ii.</span> A definition</h2>
-<p>For a linear layer <code class="inl">y = W x</code>, llama.cpp accumulates the second moment of the inputs over a calibration corpus of <em>N</em> tokens:</p>
-
-<div class="eq">
-  I<sub>i</sub> &nbsp;=&nbsp; (1 / N) &nbsp; Σ<sub>t = 1..N</sub> &nbsp; x<sub>i,t</sub><sup>2</sup>
-  <span class="lbl">eq. 1</span>
-</div>
-
-<p>Here <em>x<sub>i,t</sub></em> is the i-th input feature at token <em>t</em>, and the sum runs over every position in every calibration document. The resulting vector <em>I</em>, with one entry per input column of <em>W</em>, is the row of the imatrix that belongs to this tensor.</p>
-
-<p>Mathematically this is the same object that turns up in the diagonal of the Fisher information for a quadratic loss: the expected squared activation is a proxy for <em>how much does perturbing this column of W move the output</em>. Doubling the precision of a column with twice the expected activation halves twice as much error.</p>
-
-<aside class="note"><span class="marker">¶</span>Strictly, this is a heuristic — the true Fisher would also include downstream Jacobians. The squared-activation approximation works because the dominant contribution to per-weight loss is local, and because it can be gathered in a single forward pass with no backward graph.</aside>
+<section class="colophon">
+  <p>
+    Set in <em>Fraunces</em> and <em>Newsreader</em>, with <em>JetBrains Mono</em> for code.
+    Source lives in this repository under <code>kv-cache-explainer/</code>,
+    <code>recurrent-cache.html</code>, <code>kv-sharing.html</code>, and
+    <code>imatrix.html</code>. Each work is self-contained and reads cold; the
+    catalogue above is only a suggested order.
+  </p>
 </section>
-
-<section id="compute">
-<h2><span class="num">iii.</span> How it is gathered</h2>
-
-<p>The <code class="inl">llama-imatrix</code> binary reads a corpus of plain text, runs the model in forward-only mode at full precision, and at each linear layer captures the input tensor just before the matmul. Squared values are accumulated into a per-tensor float buffer. The corpus is typically a few hundred thousand tokens — a slice of wikitext, a domain mix, a curated chat log:</p>
-
-<pre><span class="c"># gather statistics over a calibration corpus</span>
-<span class="f">llama-imatrix</span> \
-  <span class="k">-m</span> <span class="s">models/gemma-2-9b.f16.gguf</span> \
-  <span class="k">-f</span> <span class="s">calibration/wikitext.train.raw</span> \
-  <span class="k">-o</span> <span class="s">gemma-2-9b.imatrix</span> \
-  <span class="k">--chunks</span> <span class="n">200</span> <span class="k">-c</span> <span class="n">512</span>
-
-<span class="c"># then quantize, passing the hint in</span>
-<span class="f">llama-quantize</span> \
-  <span class="k">--imatrix</span> <span class="s">gemma-2-9b.imatrix</span> \
-  <span class="s">models/gemma-2-9b.f16.gguf</span> \
-  <span class="s">models/gemma-2-9b.IQ3_M.gguf</span> \
-  <span class="k">IQ3_M</span></pre>
-
-<p>The estimate stabilizes faster than one might expect. Most channels carry consistent statistics across natural text — a hundred thousand tokens is usually within a few percent of the limit, and going to ten million changes the resulting perplexity by less than the run-to-run noise.</p>
-
-<aside class="note"><span class="marker">¶</span>Stability is a property of the second moment, not of the model. A long-tailed distribution would need orders of magnitude more samples; activations in well-trained transformers are not long-tailed.</aside>
-</section>
-
-<section id="use">
-<h2><span class="num">iv.</span> Where it enters</h2>
-
-<p>During quantization, the blockwise quantizers — Q4_K, Q5_K, the IQ family — solve a weighted least-squares problem per block of <em>n</em> weights:</p>
-
-<div class="eq">
-  minimize &nbsp; Σ<sub>i</sub> &nbsp; I<sub>i</sub> &middot; ( W<sub>i</sub> &minus; Q(W<sub>i</sub>) )<sup>2</sup>
-  <span class="lbl">eq. 2</span>
-</div>
-
-<p>instead of the unweighted form. The scale, the offset, and (for the IQ-quants) the codebook selection are all chosen to minimise this importance-weighted error. Columns with large <em>I<sub>i</sub></em> pull the grid toward themselves; columns with small <em>I<sub>i</sub></em> are allowed to drift.</p>
-
-<p>The effect is largest for the most aggressive formats. At <strong>IQ2</strong> there are essentially four representable magnitudes per block and every bit of redirected precision is consequential. At <strong>Q4_K_M</strong> the budget is generous enough that the imatrix moves perplexity by a few percent. At <strong>Q8_0</strong> there is so much headroom that the file is — for most models — indistinguishable from one quantized without a hint.</p>
-</section>
-
-<section id="empirical">
-<h2><span class="num">v.</span> What it buys</h2>
-
-<p>The improvement, measured by perplexity on held-out text, scales inversely with the bit budget. Rough magnitudes, averaged across a handful of dense decoder models:</p>
-
-<div class="chart">
-  <div class="row"><span class="name">IQ2_XS</span><span class="bar" style="--w: 88%; --d: 0.1s"></span><span class="val">−12.4%</span></div>
-  <div class="row"><span class="name">IQ3_M</span> <span class="bar" style="--w: 56%; --d: 0.2s"></span><span class="val">−7.8%</span></div>
-  <div class="row"><span class="name">Q4_K_M</span><span class="bar" style="--w: 28%; --d: 0.3s"></span><span class="val">−3.9%</span></div>
-  <div class="row"><span class="name">Q5_K_M</span><span class="bar" style="--w: 12%; --d: 0.4s"></span><span class="val">−1.6%</span></div>
-  <div class="row"><span class="name">Q6_K</span>  <span class="bar" style="--w:  4%; --d: 0.5s"></span><span class="val">−0.5%</span></div>
-  <div class="row"><span class="name">Q8_0</span>  <span class="bar" style="--w:  1%; --d: 0.6s"></span><span class="val">±0.1%</span></div>
-</div>
-
-<p>The improvement is larger still for architectures whose activations are heterogeneous: <strong>mixtures of experts</strong>, where many channels are silent on most tokens; models with <strong>attention sinks</strong>; models with long-tailed embedding statistics. For these, an unweighted quantizer is spending precision on routes that the network rarely uses. The imatrix redirects it.</p>
-</section>
-
-<div class="ornament-rule"><span>❦</span></div>
-
-<section id="caveats">
-<h2><span class="num">vi.</span> Failure modes</h2>
-
-<p>The calibration corpus matters more than any other choice. An imatrix gathered on English Wikipedia will under-weight channels that activate on source code, on non-Latin script, on chat formatting tokens, on tool-call syntax. The resulting quant will be quietly worse on those distributions — and the perplexity number on wikitext will not tell you. Most <em>this quant is worse than the official one</em> reports trace back to a mismatch between calibration text and target usage.</p>
-
-<p>The remedy is unglamorous: gather calibration data that <em>resembles what the model will be asked to do</em>. A coding model deserves a code-heavy calibration mix. A multilingual model deserves multilingual text. The imatrix is a hint, and a hint shaped wrong points the encoder in the wrong direction.</p>
-
-<aside class="note"><span class="marker">¶</span>A practical compromise that holds up: roughly sixty percent natural language across several languages, twenty-five percent code, fifteen percent structured chat. Resist the urge to over-tune; the second moment is robust, not delicate.</aside>
-</section>
-
-</div>
-</article>
-
-<footer class="colophon">
-  <div class="credit">Set in <em>Fraunces</em> and <em>Newsreader</em>; monospace in <em>JetBrains Mono</em>. Written for readers of GGUF files, against the background hum of a single GPU.</div>
-  <div class="meta">end &middot; folio 01</div>
-</footer>
-
-<script>
-/* — hero matrix visualization — */
-(function () {
-  const svg = document.getElementById('mx');
-  const COLS = 48, ROWS = 12;
-  const W = 960, H = 360;
-  const cw = W / COLS, ch = H / ROWS;
-
-  const hotspots = [
-    { x:  6, y: 3, s: 2.6, a: 1.00 },
-    { x: 22, y: 7, s: 3.4, a: 0.85 },
-    { x: 35, y: 2, s: 2.0, a: 0.72 },
-    { x: 41, y: 9, s: 2.8, a: 0.62 },
-    { x: 14, y: 9, s: 2.4, a: 0.55 },
-    { x: 30, y: 4, s: 1.8, a: 0.45 },
-  ];
-
-  function importance(i, j) {
-    let v = 0.05;
-    for (const h of hotspots) {
-      const dx = i - h.x, dy = j - h.y;
-      v += h.a * Math.exp(-(dx * dx + dy * dy) / (2 * h.s * h.s));
-    }
-    const r = Math.sin(i * 12.9898 + j * 78.233) * 43758.5453;
-    v += (r - Math.floor(r)) * 0.06 - 0.03;
-    return Math.max(0, Math.min(1, v));
-  }
-
-  const cells = [];
-  let frags = '';
-  for (let j = 0; j < ROWS; j++) {
-    for (let i = 0; i < COLS; i++) {
-      const v = importance(i, j);
-      const alpha = 0.04 + Math.pow(v, 1.35) * 0.96;
-      const x = i * cw + 1.5;
-      const y = j * ch + 1.5;
-      const w = cw - 3;
-      const h = ch - 3;
-      const delay = 80 + (i + j) * 18 + Math.random() * 80;
-      frags += `<rect class="matrix-cell" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" fill="rgba(138,36,24,${alpha.toFixed(3)})" style="animation-delay:${delay.toFixed(0)}ms"><title>ch ${i.toString().padStart(2,'0')} · I = ${v.toFixed(3)}</title></rect>`;
-      cells.push({ i, j, v });
-    }
-  }
-
-  // mark the strongest channels with a dashed outline
-  const topK = cells.slice().sort((a, b) => b.v - a.v).slice(0, 8);
-  for (const c of topK) {
-    const x = c.i * cw + 1.5;
-    const y = c.j * ch + 1.5;
-    const w = cw - 3;
-    const h = ch - 3;
-    const delay = 1500 + Math.random() * 400;
-    frags += `<rect class="matrix-cell" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" fill="none" stroke="#1a1411" stroke-width="1" stroke-dasharray="2 2" style="animation-delay:${delay.toFixed(0)}ms"></rect>`;
-  }
-
-  svg.innerHTML = frags;
-})();
-
-/* — scroll-spy for the TOC — */
-(function () {
-  const links = document.querySelectorAll('.aside .toc a');
-  const sections = Array.from(links).map(a => document.querySelector(a.getAttribute('href')));
-  function update() {
-    let active = 0;
-    const fold = window.innerHeight * 0.35;
-    for (let i = 0; i < sections.length; i++) {
-      const r = sections[i].getBoundingClientRect();
-      if (r.top <= fold) active = i;
-    }
-    links.forEach((l, i) => l.classList.toggle('active', i === active));
-  }
-  document.addEventListener('scroll', update, { passive: true });
-  update();
-})();
-</script>
 
 </body>
 </html>

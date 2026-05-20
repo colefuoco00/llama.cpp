@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>I · Why Cache at All — The KV-Cache</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="running-head">
+  <div class="inner">
+    <span class="title">The KV-Cache</span>
+    <div class="nav">
+      <a href="index.html">Contents</a>
+      <a href="01-why-cache.html" aria-current="page">I</a>
+      <a href="02-layout.html">II</a>
+      <a href="03-cells.html">III</a>
+      <a href="04-streams.html">IV</a>
+      <a href="05-iswa.html">V</a>
+      <a href="06-mask.html">VI</a>
+      <a href="07-operations.html">VII</a>
+      <a href="08-beyond.html">VIII</a>
+    </div>
+    <span class="folio">01 / 08</span>
+  </div>
+</div>
+
+<article class="page">
+
+  <header class="chapter-head fade-up">
+    <div class="chapter-number">I.</div>
+    <div class="chapter-meta">
+      <div class="kicker">Chapter the First</div>
+      <div>Foundations</div>
+    </div>
+    <h1 class="chapter-title">Why Cache at All</h1>
+    <p class="chapter-subtitle">A short argument from the arithmetic — why a transformer that generates one token at a time must, if it is to be tolerable, remember.</p>
+  </header>
+
+  <p class="lede fade-up d1">
+    The case for the cache is not philosophical. It is, plainly, a case
+    of multiplication: of doing the same one twice, or not.
+  </p>
+
+  <p class="dropcap">Suppose a decoder transformer has produced a prefix of <em>n</em> tokens and is asked to produce the next. For each layer, attention requires three matrices — queries, keys, values — formed from the hidden state by three projections. The output of the layer, for each token, is a weighted sum of the value vectors of all the tokens it attends to, where the weights come from a softmax over the dot products of its query with every key.</p>
+
+  <p>The mechanism is simple to write down:</p>
+
+  <pre><span class="lbl">attention, in one line</span><span class="cmt">// for a single query position q and a context of n keys/values:</span>
+<span class="kw">output</span>[q] = softmax( Q[q] · K[0..n]ᵀ / √d ) · V[0..n]</pre>
+
+  <p>The first time we produce a token, we compute K and V for every position in the prefix. We have to: the projections require the hidden state, and the hidden state at position <em>i</em> is what it is. But the next time? We will produce another token, which becomes position <em>n+1</em>, and once again the query at that position will want to attend to all of <em>0..n+1</em>. The keys at <em>0..n</em> have not changed. The values at <em>0..n</em> have not changed. The hidden states that produced them have not changed.</p>
+
+  <p>If we recompute them, we are paying for arithmetic whose result we already know. Over a context of any interesting length this is the dominant cost. Cache the keys and values, and decoding becomes a stream of small matrix-vector multiplies instead of a parade of growing matrix-matrix ones.</p>
+
+  <aside class="margin">
+    <span class="ref">§ 1.1 — note</span>
+    The cache only helps decode. During the initial <em>prefill</em> of a prompt, K and V are computed once for every position anyway, and the cache is simply <em>populated</em>. The asymmetry between prefill and decode is one of the most consequential facts about modern LLM serving.
+  </aside>
+
+  <h2 data-section="§ 1.2">The shape of the saving</h2>
+
+  <p>If a model has <em>L</em> layers, <em>H</em> key/value heads, and a per-head dimension <em>d</em>, then for each token we store <em>2 · L · H · d</em> scalars (the 2 is for K and V). For a 7B-class model with, say, L = 32, H = 8, d = 128, that is roughly 65,536 scalars per token per side — call it 128 KiB at fp16, or 64 KiB at int8. A 32k context therefore costs in the neighborhood of <em>4 GiB</em> at fp16, and that is the resident memory the cache eats. It is not free.</p>
+
+  <p>But the alternative — recomputation — has costs that grow with <em>n</em> at every decode step. At step <em>k</em>, you would do work proportional to <em>k</em> in each layer. Across <em>N</em> generated tokens, the total comes out quadratic in <em>N</em>, and that <em>N²</em> is what the cache flattens to linear. The trade is memory for time, and at the scale of practical contexts time is what one is forced to spend, while memory is what one is permitted to.</p>
+
+  <div class="callout">
+    <span class="label">Aside — Why <em>K</em> and <em>V</em>, not <em>Q</em>?</span>
+    <p>Each new token has exactly one query — itself. There is nothing to reuse on the Q side. The keys and values, by contrast, are the <em>function of the past</em> that future queries will consult. So Q is computed, used, and discarded; K and V are computed, used, and kept.</p>
+  </div>
+
+  <h2 data-section="§ 1.3">What llama.cpp is actually doing</h2>
+
+  <p>In <em>llama.cpp</em>, the cache is a first-class object — not a side effect of running the model, but a structure with its own header file, its own allocator, its own lifecycle. It lives in <code>src/llama-kv-cache.{h,cpp}</code>, and the entry point you meet first is the class:</p>
+
+  <pre><span class="lbl">src/llama-kv-cache.h</span><span class="kw">class</span> <span class="typ">llama_kv_cache</span> : <span class="kw">public</span> <span class="typ">llama_memory_i</span> {
+  <span class="cmt">// per-layer K and V tensors, allocated once at init</span>
+  std::vector&lt;<span class="typ">kv_layer</span>&gt; layers;
+
+  <span class="cmt">// the metadata grid: which position lives in which slot,</span>
+  <span class="cmt">// which sequences own it, what shift has been applied.</span>
+  std::vector&lt;<span class="typ">llama_kv_cells_unified</span>&gt; v_cells;
+
+  <span class="cmt">// the mapping from logical sequence to physical stream</span>
+  std::vector&lt;<span class="typ">uint32_t</span>&gt; seq_to_stream;
+  <span class="cmt">// ...</span>
+};</pre>
+
+  <p>Three things are worth absorbing from that sketch before we go further. First, the cache is per-layer: every transformer block owns its own K and V buffers, because every block computes its own K and V. Second, the cache distinguishes between the <em>data</em> (in <code>layers</code>) and the <em>metadata</em> (in <code>v_cells</code>) — what is stored, and what we know <em>about</em> what is stored. Almost every interesting operation in the file is an operation on the metadata. The data itself is mostly written once and read many times, like a tape.</p>
+
+  <p>Third, and most distinctively: a sequence and a stream are not the same thing. A sequence is a logical conversation; a stream is a physical partition of the cache. The mapping between them — managed by <code>seq_to_stream</code> — is the lever you pull to choose between batched throughput and per-conversation isolation. We will pull it ourselves in <a href="04-streams.html">Chapter IV</a>.</p>
+
+  <aside class="margin">
+    <span class="ref">cf. § 4.1</span>
+    The “stream” terminology is internal to llama.cpp and is unrelated to CUDA streams or any operating-system notion. It is a slice of the cache, nothing more.
+  </aside>
+
+  <h2 data-section="§ 1.4">The figure of merit</h2>
+
+  <p>The figure below makes the saving concrete. On the left, the work at each decode step without a cache: a triangle, growing. On the right, with a cache: a thin strip, flat.</p>
+
+  <figure class="full">
+    <div class="diagram-frame">
+      <svg viewBox="0 0 880 280" xmlns="http://www.w3.org/2000/svg">
+        <!-- LEFT: no cache -->
+        <g transform="translate(40,30)">
+          <text class="dg-title" x="0" y="0">Without cache</text>
+          <text class="dg-label" x="0" y="16">work per decode step</text>
+
+          <!-- triangle of growing recomputation -->
+          <g transform="translate(0,40)">
+            <!-- axis -->
+            <line x1="0" y1="180" x2="360" y2="180" class="dg-stroke"/>
+            <line x1="0" y1="0"   x2="0"   y2="180" class="dg-stroke"/>
+            <!-- bars -->
+            <g>
+              <rect x="20"  y="170" width="22" height="10"  class="dg-fill-soft"/>
+              <rect x="50"  y="155" width="22" height="25"  class="dg-fill-soft"/>
+              <rect x="80"  y="135" width="22" height="45"  class="dg-fill-soft"/>
+              <rect x="110" y="110" width="22" height="70"  class="dg-fill-soft"/>
+              <rect x="140" y="80"  width="22" height="100" class="dg-fill-soft"/>
+              <rect x="170" y="45"  width="22" height="135" fill="#b73a26"/>
+              <rect x="200" y="10"  width="22" height="170" fill="#b73a26"/>
+            </g>
+            <text class="dg-label" x="0" y="200">step →</text>
+            <text class="dg-label" x="200" y="200">step n</text>
+            <text class="dg-text"  x="232" y="20" fill="#b73a26">O(n) per step</text>
+            <text class="dg-text"  x="232" y="36">→ O(n²) total</text>
+          </g>
+        </g>
+
+        <!-- divider -->
+        <line x1="440" y1="20" x2="440" y2="260" class="dg-stroke-soft dg-dashed"/>
+
+        <!-- RIGHT: with cache -->
+        <g transform="translate(480,30)">
+          <text class="dg-title" x="0" y="0">With KV cache</text>
+          <text class="dg-label" x="0" y="16">work per decode step</text>
+
+          <g transform="translate(0,40)">
+            <line x1="0" y1="180" x2="360" y2="180" class="dg-stroke"/>
+            <line x1="0" y1="0"   x2="0"   y2="180" class="dg-stroke"/>
+
+            <g>
+              <rect x="20"  y="170" width="22" height="10" class="dg-fill-soft"/>
+              <rect x="50"  y="170" width="22" height="10" class="dg-fill-soft"/>
+              <rect x="80"  y="168" width="22" height="12" class="dg-fill-soft"/>
+              <rect x="110" y="170" width="22" height="10" class="dg-fill-soft"/>
+              <rect x="140" y="168" width="22" height="12" class="dg-fill-soft"/>
+              <rect x="170" y="170" width="22" height="10" fill="#b73a26"/>
+              <rect x="200" y="168" width="22" height="12" fill="#b73a26"/>
+            </g>
+            <text class="dg-label" x="0" y="200">step →</text>
+            <text class="dg-label" x="200" y="200">step n</text>
+            <text class="dg-text"  x="232" y="20" fill="#b73a26">O(1) per step</text>
+            <text class="dg-text"  x="232" y="36">→ O(n) total</text>
+
+            <!-- the "memory" rectangle that grows -->
+            <g transform="translate(0,-26)">
+              <rect x="20" y="-8" width="202" height="6" fill="#354152" opacity="0.7"/>
+              <text class="dg-label" x="20" y="-12">resident memory ↑ linear in n</text>
+            </g>
+          </g>
+        </g>
+      </svg>
+    </div>
+    <figcaption>
+      <span class="fig-num">Fig. 1.1</span>
+      <span class="fig-desc">The two regimes. Without a cache, each new token pays for everything before it. With a cache, each new token pays only for itself — at a fixed cost in memory that scales with the prefix.</span>
+    </figcaption>
+  </figure>
+
+  <h2 data-section="§ 1.5">Where we go from here</h2>
+
+  <p>Having argued that the cache must exist, the remaining seven chapters describe what <em>llama.cpp</em>'s cache actually is. The next chapter (<a href="02-layout.html">II</a>) lays out the tensors in memory — their shapes, their dtypes, what is stored transposed and why. After that, we leave the tensors behind for a long while and look at the metadata grid — the <em>cells</em> — that decides which token's K and V live in which physical slot. The bookkeeping is, perhaps surprisingly, where most of the cleverness is.</p>
+
+  <p>A cache that merely stored old keys would not be very interesting. A cache that lets multiple sequences share slots, that lets a sliding window be enforced through a mask rather than a free, that lets positions be shifted without moving data, that lets one sequence be forked from another in O(1) — that is a cache worth describing. So we shall.</p>
+
+  <nav class="footer-nav">
+    <a href="index.html" class="prev">
+      <span class="label">Front matter</span>
+      <span class="ttl">Contents</span>
+    </a>
+    <a href="02-layout.html" class="next">
+      <span class="label">Chapter II</span>
+      <span class="ttl">The Layout in Memory</span>
+    </a>
+  </nav>
+
+</article>
+
+</body>
+</html>

@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IV · Streams and Sequences — The KV-Cache</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="running-head">
+  <div class="inner">
+    <span class="title">The KV-Cache</span>
+    <div class="nav">
+      <a href="index.html">Contents</a>
+      <a href="01-why-cache.html">I</a>
+      <a href="02-layout.html">II</a>
+      <a href="03-cells.html">III</a>
+      <a href="04-streams.html" aria-current="page">IV</a>
+      <a href="05-iswa.html">V</a>
+      <a href="06-mask.html">VI</a>
+      <a href="07-operations.html">VII</a>
+      <a href="08-beyond.html">VIII</a>
+    </div>
+    <span class="folio">04 / 08</span>
+  </div>
+</div>
+
+<article class="page">
+
+  <header class="chapter-head fade-up">
+    <div class="chapter-number">IV.</div>
+    <div class="chapter-meta">
+      <div class="kicker">Chapter the Fourth</div>
+      <div>Partitioning</div>
+    </div>
+    <h1 class="chapter-title">Streams and Sequences</h1>
+    <p class="chapter-subtitle">One cache for everyone, or a cache per conversation. Two layouts, one flag, and the consequences of either choice.</p>
+  </header>
+
+  <p class="lede fade-up d1">
+    A sequence is what the user has — a conversation. A stream is what the cache has —
+    a slice of itself. The mapping between them is yours to pick.
+  </p>
+
+  <p class="dropcap">The cache's third tensor dimension, mentioned and dismissed in the previous two chapters, is <code>n_stream</code>. Its purpose is partitioning. When <code>n_stream</code> is 1, the entire <code>kv_size</code> capacity is one large pool, and every sequence the cache holds competes for slots in that pool. When <code>n_stream</code> is greater than 1, the capacity is divided into per-stream sub-pools, and each sequence is assigned a stream at creation time. The mapping from sequence to stream is the <code>seq_to_stream</code> array.</p>
+
+  <pre><span class="lbl">src/llama-kv-cache.h — line ~263</span><span class="kw">class</span> <span class="typ">llama_kv_cache</span> {
+    <span class="cmt">// one cells object per stream</span>
+    std::vector&lt;<span class="typ">llama_kv_cells_unified</span>&gt; v_cells;
+
+    <span class="cmt">// for each sequence id, the stream it lives in</span>
+    std::vector&lt;<span class="typ">uint32_t</span>&gt; seq_to_stream;
+    <span class="cmt">// ...</span>
+};</pre>
+
+  <p>If your model serves a single user conversation at a time, <code>n_stream</code> = 1 is almost certainly the right answer. The interesting case is the one where several conversations are in flight simultaneously and the question becomes: should they share, or be isolated?</p>
+
+  <h2 data-section="§ 4.1">Two regimes, side by side</h2>
+
+  <p>Try toggling between them.</p>
+
+  <div class="full">
+    <div class="diagram-frame">
+      <div class="toggle-group" id="mode-toggle">
+        <button class="active" data-mode="unified">Unified · n_stream = 1</button>
+        <button data-mode="per-seq">Per-sequence · n_stream = n_seq_max</button>
+      </div>
+
+      <svg id="stream-svg" viewBox="0 0 880 240" xmlns="http://www.w3.org/2000/svg" style="margin-top:0.5rem;">
+        <!-- frame -->
+        <rect x="20" y="40" width="840" height="160" class="dg-stroke" fill="none"/>
+        <text class="dg-label" x="20" y="32">kv_size  (total cache capacity)</text>
+
+        <!-- stream group: rendered by JS -->
+        <g id="streams"></g>
+
+        <!-- seq_to_stream legend -->
+        <g transform="translate(20, 215)" id="legend"></g>
+      </svg>
+    </div>
+    <figcaption>
+      <span class="fig-num">Fig. 4.1</span>
+      <span class="fig-desc">In unified mode all sequences share one pool. In per-sequence mode each sequence owns a stream and cannot touch the others.</span>
+    </figcaption>
+  </div>
+
+  <script>
+    (function () {
+      const SEQS = [
+        { sid: 0, len: 26, color: '#b73a26' },
+        { sid: 1, len: 18, color: '#354152' },
+        { sid: 2, len: 30, color: '#7a3a1c' },
+        { sid: 3, len: 12, color: '#4a6b2e' },
+      ];
+      const TOTAL = 96; // total slots in the figure
+      const W = 840, X0 = 20, Y0 = 40, H = 160;
+
+      function draw(mode) {
+        const streams = document.getElementById('streams');
+        const legend = document.getElementById('legend');
+        streams.innerHTML = '';
+        legend.innerHTML = '';
+
+        if (mode === 'unified') {
+          // single pool: sequences laid down in order
+          let cursor = 0;
+          for (const s of SEQS) {
+            const x = X0 + (cursor / TOTAL) * W;
+            const w = (s.len / TOTAL) * W;
+            streams.insertAdjacentHTML('beforeend',
+              `<rect x="${x}" y="${Y0 + 30}" width="${w}" height="100" fill="${s.color}" opacity="0.85" stroke="#1a1715"/>` +
+              `<text x="${x + 6}" y="${Y0 + 50}" class="dg-text" fill="#f1e9d4">seq ${s.sid}</text>`
+            );
+            cursor += s.len;
+          }
+          // free space
+          const fx = X0 + (cursor / TOTAL) * W;
+          const fw = W - (cursor / TOTAL) * W;
+          if (fw > 0) {
+            streams.insertAdjacentHTML('beforeend',
+              `<rect x="${fx}" y="${Y0 + 30}" width="${fw}" height="100" fill="#e7decb" stroke="#c8b890" stroke-dasharray="3 3"/>` +
+              `<text x="${fx + 10}" y="${Y0 + 86}" class="dg-label">free</text>`
+            );
+          }
+          // label
+          streams.insertAdjacentHTML('beforeend',
+            `<text x="20" y="${Y0 + 22}" class="dg-label" fill="#b73a26">stream 0  — capacity ${TOTAL}</text>`
+          );
+
+          // legend
+          legend.insertAdjacentHTML('beforeend',
+            `<text x="0" y="0" class="dg-label">seq_to_stream = [0, 0, 0, 0]   —   every sequence lives in stream 0</text>`
+          );
+        } else {
+          // per-sequence: 4 streams of equal width
+          const PER = TOTAL / 4; // 24 slots each
+          for (let i = 0; i < SEQS.length; i++) {
+            const s = SEQS[i];
+            const lane = i;
+            const x = X0 + (lane * (W / 4));
+            const w = (W / 4);
+            // lane background
+            streams.insertAdjacentHTML('beforeend',
+              `<rect x="${x}" y="${Y0 + 30}" width="${w}" height="100" fill="#e7decb" stroke="#c8b890"/>`
+            );
+            // occupancy
+            const occ = Math.min(s.len, PER) / PER * w;
+            streams.insertAdjacentHTML('beforeend',
+              `<rect x="${x}" y="${Y0 + 30}" width="${occ}" height="100" fill="${s.color}" opacity="0.85" stroke="#1a1715"/>`
+            );
+            // overflow indicator
+            if (s.len > PER) {
+              streams.insertAdjacentHTML('beforeend',
+                `<text x="${x + w/2 - 30}" y="${Y0 + 152}" class="dg-label" fill="#b73a26">overflow!</text>`
+              );
+            }
+            // lane label
+            streams.insertAdjacentHTML('beforeend',
+              `<text x="${x + 6}" y="${Y0 + 22}" class="dg-label" fill="#b73a26">stream ${i}</text>` +
+              `<text x="${x + 6}" y="${Y0 + 50}" class="dg-text" fill="#f1e9d4">seq ${s.sid}</text>`
+            );
+            // lane divider
+            if (i > 0) {
+              streams.insertAdjacentHTML('beforeend',
+                `<line x1="${x}" y1="${Y0 + 30}" x2="${x}" y2="${Y0 + 130}" stroke="#1a1715" stroke-width="1.2"/>`
+              );
+            }
+          }
+          legend.insertAdjacentHTML('beforeend',
+            `<text x="0" y="0" class="dg-label">seq_to_stream = [0, 1, 2, 3]   —   one stream per sequence, no sharing</text>`
+          );
+        }
+      }
+
+      document.querySelectorAll('#mode-toggle button').forEach(b => {
+        b.addEventListener('click', e => {
+          document.querySelectorAll('#mode-toggle button').forEach(x => x.classList.remove('active'));
+          b.classList.add('active');
+          draw(b.dataset.mode);
+        });
+      });
+      draw('unified');
+    })();
+  </script>
+
+  <h2 data-section="§ 4.2">The unified case</h2>
+
+  <p>In <em>unified</em> mode, <code>n_stream</code> is 1 and every sequence shares the cache's slots. The <code>seq_to_stream</code> mapping is uniformly zero. The advantages are real: sequences can be batched together in a single ubatch, the allocator has one pool to work with (no fragmentation between streams), and prefix-sharing between sequences is as cheap as setting an additional bit in a cell's <code>seq</code> bitset.</p>
+
+  <p>The cost is that a sequence which generates a great deal of context will eat into the capacity available to other sequences. If you have a fixed budget — say, eight users hitting a server, each capped at 4k tokens — unified mode does not by itself enforce that cap. The allocator simply hands out slots until it runs out. The cap has to be enforced by the caller, with <code>seq_rm</code>.</p>
+
+  <h2 data-section="§ 4.3">The per-sequence case</h2>
+
+  <p>In <em>per-sequence</em> mode, <code>n_stream</code> equals the maximum number of sequences the cache will hold, and each sequence is bound to its own stream. The streams cannot exchange cells: sequence 3 cannot reach into stream 1 to find a slot. The cap is structural.</p>
+
+  <p>The advantages: per-sequence isolation, predictable memory per conversation, no contention between sequences for slots. The disadvantages: no prefix sharing (the cells are in different streams, so a fork must be a copy), more total memory (each stream is a separate pool), and reduced batching opportunities — since each sequence has its own cell layout, some operations have to be performed per-stream rather than across the whole cache.</p>
+
+  <div class="callout">
+    <span class="label">Which to choose</span>
+    <p>If your sequences share prefixes (speculative decoding, chat-with-system-prompt, batch eval over the same context), <em>unified</em>. If your sequences are independent users on a shared server and you need a hard cap per user, <em>per-sequence</em>. The default in <code>llama.cpp</code> is unified — but a number of <em>llama-server</em> deployments turn it off for the isolation guarantees.</p>
+  </div>
+
+  <h2 data-section="§ 4.4">Stream copies, deferred</h2>
+
+  <p>One subtlety. When a <code>seq_cp</code> operation copies a sequence's cached tokens to another sequence — say, forking a draft from the trunk — the destination might be in a different stream. The two streams are different physical regions of the K and V tensors; this is a real data copy on the device, not just a metadata flip.</p>
+
+  <p>The cache does not perform that copy immediately. It queues the request in a <code>sc_info</code> (stream-copy info) structure and defers it until the next <code>update()</code> call, where it executes as <code>ggml_backend_tensor_copy</code> on the device. The deferral lets the cache batch multiple copies, plan the allocator without committing to data motion, and recover gracefully if the operation is abandoned. The user-facing semantics are unchanged — after <code>seq_cp</code> returns, the destination behaves as if the copy happened — but the bytes haven't moved yet.</p>
+
+  <pre><span class="lbl">src/llama-kv-cache.h — line ~22</span><span class="kw">struct</span> <span class="typ">stream_copy_info</span> {
+    <span class="kw">uint32_t</span> stream_src;
+    <span class="kw">uint32_t</span> stream_dst;
+    std::vector&lt;<span class="kw">uint32_t</span>&gt; cells_src;   <span class="cmt">// physical slots in src stream</span>
+    std::vector&lt;<span class="kw">uint32_t</span>&gt; cells_dst;   <span class="cmt">// physical slots in dst stream</span>
+};</pre>
+
+  <aside class="margin">
+    <span class="ref">§ 4.4 — invariant</span>
+    Within a single stream, <code>seq_cp</code> is a metadata operation: the destination simply joins the source's bitset. Across streams, it is a deferred device copy. The caller never has to know which one happened.
+  </aside>
+
+  <h2 data-section="§ 4.5">A note on naming</h2>
+
+  <p>The word <em>stream</em> is overloaded in any system that also runs on a GPU: CUDA streams, audio streams, IO streams. The streams discussed in this chapter are none of those. They are a logical partitioning of cache slots, internal to <em>llama.cpp</em>. The same code, on the same GPU, with the same number of CUDA streams, will behave differently depending on whether <code>n_stream</code> is 1 or greater. We mention this because it confuses the first reader of the source every time.</p>
+
+  <p>Having now described what cells are and how they are grouped into streams, we have most of the structural vocabulary the rest of the cache uses. One large piece remains before we can talk about operations on the cache: the <em>variants</em>. The cache we have been describing is the unified one. There is a second, the ISWA wrapper, which exists for models with sliding-window attention. The next chapter explains it.</p>
+
+  <nav class="footer-nav">
+    <a href="03-cells.html" class="prev">
+      <span class="label">Chapter III</span>
+      <span class="ttl">Cells, Slots, and the Allocator</span>
+    </a>
+    <a href="05-iswa.html" class="next">
+      <span class="label">Chapter V</span>
+      <span class="ttl">Two Caches, Interleaved</span>
+    </a>
+  </nav>
+
+</article>
+
+</body>
+</html>

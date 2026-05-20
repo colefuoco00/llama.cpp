@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>III · Cells, Slots, and the Allocator — The KV-Cache</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="running-head">
+  <div class="inner">
+    <span class="title">The KV-Cache</span>
+    <div class="nav">
+      <a href="index.html">Contents</a>
+      <a href="01-why-cache.html">I</a>
+      <a href="02-layout.html">II</a>
+      <a href="03-cells.html" aria-current="page">III</a>
+      <a href="04-streams.html">IV</a>
+      <a href="05-iswa.html">V</a>
+      <a href="06-mask.html">VI</a>
+      <a href="07-operations.html">VII</a>
+      <a href="08-beyond.html">VIII</a>
+    </div>
+    <span class="folio">03 / 08</span>
+  </div>
+</div>
+
+<article class="page">
+
+  <header class="chapter-head fade-up">
+    <div class="chapter-number">III.</div>
+    <div class="chapter-meta">
+      <div class="kicker">Chapter the Third</div>
+      <div>Bookkeeping</div>
+    </div>
+    <h1 class="chapter-title">Cells, Slots, and the Allocator</h1>
+    <p class="chapter-subtitle">Where the cache stops being a tensor and starts being a bookkeeping problem. The metadata grid that decides which token lives where.</p>
+  </header>
+
+  <p class="lede fade-up d1">
+    A cache that knows what it stores is worth several caches that don't.
+    Most of the cleverness in <em>llama.cpp</em>'s KV cache is in the metadata.
+  </p>
+
+  <p class="dropcap">In the last chapter we described the cache's <em>data</em> — the K and V tensors, allocated up front, indexed by physical slot. Now we turn to its <em>metadata</em>: the bookkeeping that says which logical token (sequence X, position Y) is stored in which physical slot. This is the work of the class <code>llama_kv_cells_unified</code>, defined in <code>src/llama-kv-cells.h</code>. It is the most opinionated part of the cache, and the part that earns its name.</p>
+
+  <h2 data-section="§ 3.1">A cell is a record</h2>
+
+  <p>A cell, in this code, is the per-slot bundle of metadata. The class stores four parallel arrays of length <code>kv_size</code> — one entry per physical slot. For slot <em>i</em>:</p>
+
+  <pre><span class="lbl">src/llama-kv-cells.h — line ~488</span><span class="kw">class</span> <span class="typ">llama_kv_cells</span> {
+    std::vector&lt;<span class="typ">llama_pos</span>&gt;      pos;    <span class="cmt">// position in the sequence, -1 if empty</span>
+    std::vector&lt;<span class="typ">llama_pos</span>&gt;      shift;  <span class="cmt">// accumulated position shift (RoPE-relevant)</span>
+    std::vector&lt;<span class="typ">seq_set_t</span>&gt;      seq;    <span class="cmt">// bitset: which sequences own this slot</span>
+    std::vector&lt;<span class="typ">llama_kv_cell_ext</span>&gt; ext; <span class="cmt">// 2D coords for M-RoPE</span>
+
+    <span class="cmt">// derived: the set of cells that are non-empty,</span>
+    <span class="cmt">// kept up to date for fast iteration.</span>
+    std::set&lt;<span class="kw">uint32_t</span>&gt; used;
+};</pre>
+
+  <p>The four fields together answer four questions:</p>
+
+  <ul class="dashes">
+    <li><strong><code>pos</code></strong> — at what logical position does this slot live? A sentinel of <em>-1</em> means the slot is empty.</li>
+    <li><strong><code>seq</code></strong> — which sequences claim it? A bitset, because a single slot can be owned by several sequences simultaneously (more on this in §3.4).</li>
+    <li><strong><code>shift</code></strong> — has the position been displaced from its original value? RoPE cares; the rest of the cache mostly does not.</li>
+    <li><strong><code>ext</code></strong> — for models that use 2D positions (M-RoPE, multimodal), what row and column does this slot represent?</li>
+  </ul>
+
+  <aside class="margin">
+    <span class="ref">§ 3.1 — design</span>
+    The split between data and metadata is what makes seq_cp, seq_rm, find_slot, and friends cheap: they manipulate a few short arrays, not the gigabytes of cached K/V.
+  </aside>
+
+  <p>And one derived value: <code>used</code>, the set of slot indices that are currently non-empty. It is kept in sync with the <code>pos</code> array as slots are claimed and released. The set lets the mask-builder, the defrag logic, and the various seq_* operations iterate only over the cells that matter — usually a tiny fraction of <code>kv_size</code>.</p>
+
+  <h2 data-section="§ 3.2">An interactive cell grid</h2>
+
+  <p>Before we look at the allocator algorithm, it helps to see the cells. Below is a 32-slot toy cache. The colored cells are occupied; the pale cells are free. Click <em>Generate</em> to scatter a few sequences across it; click <em>find_slot</em> to scan for a contiguous run of free cells, as the real allocator does.</p>
+
+  <div class="full">
+    <div class="diagram-frame cell-grid-demo">
+      <div class="cells" id="cells"></div>
+      <div class="controls">
+        <button id="generate">Generate</button>
+        <button id="findslot" class="primary">find_slot(n=4)</button>
+        <button id="clearall">Clear</button>
+        <div class="status" id="status">32 slots — 0 used</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const N = 32;
+      const root = document.getElementById('cells');
+      const status = document.getElementById('status');
+      let cells = new Array(N).fill(null);  // {pos, sid} or null
+
+      // The real grid is 1×32 here; we re-style the CSS grid to 16-wide
+      root.style.gridTemplateColumns = `repeat(${N/2}, 1fr)`;
+
+      function render(highlight = -1, taken = []) {
+        root.innerHTML = '';
+        for (let i = 0; i < N; i++) {
+          const div = document.createElement('div');
+          const c = cells[i];
+          let cls = 'cell ' + (c ? `s${c.sid}` : 'empty');
+          if (i === highlight) cls += ' scan';
+          if (taken.includes(i)) cls += ' taken';
+          div.className = cls;
+          if (c) {
+            div.innerHTML = `<span class="pos">${c.pos}</span><span class="sid">s${c.sid}</span>`;
+          } else {
+            div.innerHTML = `<span class="pos">·</span>`;
+          }
+          root.appendChild(div);
+        }
+        const used = cells.filter(x => x).length;
+        status.textContent = `${N} slots — ${used} used`;
+      }
+
+      function generate() {
+        cells = new Array(N).fill(null);
+        // sequence 0 occupies positions 0..9 in slots 0..9
+        for (let i = 0; i < 10; i++) cells[i] = { pos: i, sid: 0 };
+        // small gap, then sequence 1 in slots 12..18
+        for (let i = 0; i < 7; i++) cells[12 + i] = { pos: i, sid: 1 };
+        // sequence 2 occupies slots 22..25 leaving room at the end
+        for (let i = 0; i < 4; i++) cells[22 + i] = { pos: i, sid: 2 };
+        render();
+      }
+
+      function findSlot(n) {
+        let i = 0;
+        const interval = setInterval(() => {
+          if (i > N - n) {
+            clearInterval(interval);
+            status.textContent = `find_slot(${n}) → no contiguous run found`;
+            render();
+            return;
+          }
+          // check if cells[i..i+n] are all empty
+          let ok = true;
+          for (let k = 0; k < n; k++) if (cells[i + k]) { ok = false; break; }
+          if (ok) {
+            clearInterval(interval);
+            const taken = [];
+            // claim them as a new sequence (sid 1 reuse for color)
+            for (let k = 0; k < n; k++) {
+              cells[i + k] = { pos: k, sid: 1 };
+              taken.push(i + k);
+            }
+            render(-1, taken);
+            status.textContent = `find_slot(${n}) → ran starting at slot ${i}`;
+            return;
+          }
+          render(i);
+          i++;
+        }, 90);
+      }
+
+      document.getElementById('generate').addEventListener('click', generate);
+      document.getElementById('findslot').addEventListener('click', () => findSlot(4));
+      document.getElementById('clearall').addEventListener('click', () => {
+        cells = new Array(N).fill(null);
+        render();
+      });
+
+      generate();
+    })();
+  </script>
+
+  <p style="margin-top:0.3rem;">The real algorithm is a little more careful than the toy. It considers SWA-masked cells as candidates for reclamation, it prefers runs that have been free the longest, and it understands sequence sharing — but the kernel of it is what you see: a scan for a contiguous run of free slots large enough to hold the incoming ubatch.</p>
+
+  <h2 data-section="§ 3.3">find_slot, in earnest</h2>
+
+  <p>The allocator entry point is <code>find_slot</code>, in <code>src/llama-kv-cache.cpp</code>. Its job: given a ubatch of <em>m</em> tokens (each with a position and a sequence-id), find a set of physical slots large enough to hold them, satisfying the constraints of the cache configuration. In the default <em>unified</em> mode, this means a contiguous run; in the per-sequence mode it means a run within a specific stream. SWA-aware caches additionally treat cells that have fallen out of the sliding window as reclaimable.</p>
+
+  <pre><span class="lbl">src/llama-kv-cache.cpp — ~ line 818</span>slot_info <span class="fn">find_slot</span>(<span class="kw">const</span> llama_ubatch &amp; ubatch, ...) {
+    <span class="kw">const</span> <span class="typ">uint32_t</span> n_tokens = ubatch.n_tokens;
+
+    <span class="cmt">// scan the cells array looking for a viable home for this ubatch.</span>
+    <span class="cmt">// "viable" depends on:</span>
+    <span class="cmt">//   - the stream the sequences map to</span>
+    <span class="cmt">//   - which cells are empty (pos == -1)</span>
+    <span class="cmt">//   - which cells are masked out by SWA and can be reused</span>
+    <span class="cmt">//   - whether we need a contiguous run (unified) or can scatter</span>
+
+    <span class="kw">for</span> (<span class="typ">uint32_t</span> s = 0; s + n_tokens &lt;= kv_size; ++s) {
+        <span class="kw">if</span> (<span class="fn">can_place_at</span>(s, ubatch)) {
+            <span class="kw">return</span> slot_info{ /* starting slot s */ };
+        }
+    }
+    <span class="kw">return</span> slot_info::error();
+}</pre>
+
+  <p>If <code>find_slot</code> returns an error, the batch driver has options. It can try a smaller ubatch. It can request a defrag — though, as we'll see in <a href="07-operations.html">Chapter VII</a>, defrag in this cache is mostly accomplished without moving data. Or it can give up and report the failure upward.</p>
+
+  <h2 data-section="§ 3.4">Sequence sharing</h2>
+
+  <p>Here is the move that makes the cache more than a buffer. A single cell can be owned by more than one sequence, as long as they agree on what is stored there. The <code>seq</code> field is a bitset, not a single index. When two sequences share a prefix — most commonly because one was forked from the other — they share the cells, too. Forking a sequence is therefore an O(<em>k</em>) operation in metadata only, where <em>k</em> is the prefix length, and a no-op in data.</p>
+
+  <figure class="full">
+    <div class="diagram-frame">
+      <svg viewBox="0 0 880 220" xmlns="http://www.w3.org/2000/svg">
+        <!-- title -->
+        <text class="dg-title" x="20" y="24">A fork at position 6</text>
+        <text class="dg-label" x="20" y="40">sequences 0 and 1 share slots 0–5; they diverge from slot 6.</text>
+
+        <!-- the cell strip -->
+        <g transform="translate(20, 70)">
+          <!-- 14 cells -->
+          <g>
+            <!-- shared -->
+            <g>
+              <rect x="0"   y="0" width="50" height="60" fill="#d8c8a0" stroke="#1a1715"/>
+              <rect x="50"  y="0" width="50" height="60" fill="#d8c8a0" stroke="#1a1715"/>
+              <rect x="100" y="0" width="50" height="60" fill="#d8c8a0" stroke="#1a1715"/>
+              <rect x="150" y="0" width="50" height="60" fill="#d8c8a0" stroke="#1a1715"/>
+              <rect x="200" y="0" width="50" height="60" fill="#d8c8a0" stroke="#1a1715"/>
+              <rect x="250" y="0" width="50" height="60" fill="#d8c8a0" stroke="#1a1715"/>
+            </g>
+            <!-- seq 0 continuation -->
+            <g>
+              <rect x="300" y="0" width="50" height="60" fill="#d8b8a0" stroke="#1a1715"/>
+              <rect x="350" y="0" width="50" height="60" fill="#d8b8a0" stroke="#1a1715"/>
+              <rect x="400" y="0" width="50" height="60" fill="#d8b8a0" stroke="#1a1715"/>
+            </g>
+            <!-- seq 1 continuation -->
+            <g>
+              <rect x="450" y="0" width="50" height="60" fill="#b8c8a0" stroke="#1a1715"/>
+              <rect x="500" y="0" width="50" height="60" fill="#b8c8a0" stroke="#1a1715"/>
+              <rect x="550" y="0" width="50" height="60" fill="#b8c8a0" stroke="#1a1715"/>
+              <rect x="600" y="0" width="50" height="60" fill="#b8c8a0" stroke="#1a1715"/>
+            </g>
+            <!-- positions -->
+            <g class="dg-text">
+              <text x="20"  y="35">0</text>
+              <text x="70"  y="35">1</text>
+              <text x="120" y="35">2</text>
+              <text x="170" y="35">3</text>
+              <text x="220" y="35">4</text>
+              <text x="270" y="35">5</text>
+              <text x="320" y="35">6</text>
+              <text x="370" y="35">7</text>
+              <text x="420" y="35">8</text>
+              <text x="470" y="35">6</text>
+              <text x="520" y="35">7</text>
+              <text x="570" y="35">8</text>
+              <text x="620" y="35">9</text>
+            </g>
+            <!-- seq labels in cells -->
+            <g style="font-family:var(--mono); font-size:9px; fill:#3a342c;">
+              <text x="10"  y="52">{0,1}</text>
+              <text x="60"  y="52">{0,1}</text>
+              <text x="110" y="52">{0,1}</text>
+              <text x="160" y="52">{0,1}</text>
+              <text x="210" y="52">{0,1}</text>
+              <text x="260" y="52">{0,1}</text>
+              <text x="312" y="52">{0}</text>
+              <text x="362" y="52">{0}</text>
+              <text x="412" y="52">{0}</text>
+              <text x="462" y="52">{1}</text>
+              <text x="512" y="52">{1}</text>
+              <text x="562" y="52">{1}</text>
+              <text x="612" y="52">{1}</text>
+            </g>
+          </g>
+
+          <!-- bracket: shared -->
+          <g transform="translate(0, 78)">
+            <line x1="0" y1="0" x2="300" y2="0" class="dg-stroke"/>
+            <line x1="0" y1="-4" x2="0" y2="6" class="dg-stroke"/>
+            <line x1="300" y1="-4" x2="300" y2="6" class="dg-stroke"/>
+            <text class="dg-label" x="120" y="24">shared prefix · seq.is({0,1})</text>
+          </g>
+          <!-- bracket: seq 0 -->
+          <g transform="translate(300, 78)">
+            <line x1="0" y1="0" x2="150" y2="0" class="dg-accent"/>
+            <line x1="0" y1="-4" x2="0" y2="6" class="dg-accent"/>
+            <line x1="150" y1="-4" x2="150" y2="6" class="dg-accent"/>
+            <text class="dg-label" x="40" y="24" fill="#b73a26">seq 0 only</text>
+          </g>
+          <!-- bracket: seq 1 -->
+          <g transform="translate(450, 78)">
+            <line x1="0" y1="0" x2="200" y2="0" class="dg-accent"/>
+            <line x1="0" y1="-4" x2="0" y2="6" class="dg-accent"/>
+            <line x1="200" y1="-4" x2="200" y2="6" class="dg-accent"/>
+            <text class="dg-label" x="60" y="24" fill="#b73a26">seq 1 only</text>
+          </g>
+        </g>
+      </svg>
+    </div>
+    <figcaption>
+      <span class="fig-num">Fig. 3.1</span>
+      <span class="fig-desc">Two sequences sharing a prefix occupy the same cells. The <code>seq</code> bitset records the shared ownership; the data tensor stores one copy of K and V for the shared positions.</span>
+    </figcaption>
+  </figure>
+
+  <p>Sequence sharing is what makes speculative decoding tolerable. A draft model produces several candidate continuations from the same prefix; if each candidate had to recompute or duplicate the prefix's K and V, the speculation would cost more than it saved. With shared cells, the draft sequences fork off the trunk for free and pay only for their unique tails.</p>
+
+  <h2 data-section="§ 3.5">Position shift</h2>
+
+  <p>The <code>shift</code> field is a small concession to a model architecture decision. RoPE rotates K (and Q) by an angle proportional to position; once a K has been rotated and stored, you cannot interpret it as belonging to a different position without un-rotating and re-rotating it. So when a sequence's positions are shifted — typically by <code>seq_add</code>, used to slide a context window — the cache cannot just change <code>pos</code> and call it a day. It must, eventually, re-rotate the stored K to the new positions.</p>
+
+  <p>It does this lazily. The <code>shift</code> field records that a slot's position has been displaced by some delta but its K has not yet been re-rotated. A separate compute graph, run on the next forward pass, walks the cells with non-zero shifts and applies the rotation update on the device, without ever pulling the K back to the host. The shift is then cleared.</p>
+
+  <aside class="margin">
+    <span class="ref">cf. § 7.4</span>
+    The deferred K-shift graph is one of the more clever bits of engineering in the cache: defrag and shift are both done <em>without</em> data motion outside of the GPU.
+  </aside>
+
+  <h2 data-section="§ 3.6">2D positions</h2>
+
+  <p>The <code>ext</code> field is, for most models, dead weight. It exists for those that need it — M-RoPE-style models that index tokens not by a single integer but by a pair (row, column), and so need to record both for each cell. The cache happily carries the extra information through; the mask-builder consults it when constructing 2D-aware attention. For a vanilla 1-D model, <code>ext</code> is uninitialized and ignored.</p>
+
+  <h2 data-section="§ 3.7">A summary, before we move on</h2>
+
+  <p>The metadata grid is small, dense, and almost free to query. Every operation on the cache that does not touch data — and that is most of them — operates on it. The grid is what makes a fork O(<em>k</em>), a sliding window an O(1) mask predicate, and a defrag a re-numbering rather than a copy. The grid is, in this sense, the cache.</p>
+
+  <p>The next chapter turns to the way the grid is partitioned across sequences — the question of <em>streams</em>. It is the question of whether one big shared cache, or many small per-conversation caches, is the right model — and the answer is a flag with consequences.</p>
+
+  <nav class="footer-nav">
+    <a href="02-layout.html" class="prev">
+      <span class="label">Chapter II</span>
+      <span class="ttl">The Layout in Memory</span>
+    </a>
+    <a href="04-streams.html" class="next">
+      <span class="label">Chapter IV</span>
+      <span class="ttl">Streams and Sequences</span>
+    </a>
+  </nav>
+
+</article>
+
+</body>
+</html>

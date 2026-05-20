@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VII · The Lifecycle of an Operation — The KV-Cache</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="running-head">
+  <div class="inner">
+    <span class="title">The KV-Cache</span>
+    <div class="nav">
+      <a href="index.html">Contents</a>
+      <a href="01-why-cache.html">I</a>
+      <a href="02-layout.html">II</a>
+      <a href="03-cells.html">III</a>
+      <a href="04-streams.html">IV</a>
+      <a href="05-iswa.html">V</a>
+      <a href="06-mask.html">VI</a>
+      <a href="07-operations.html" aria-current="page">VII</a>
+      <a href="08-beyond.html">VIII</a>
+    </div>
+    <span class="folio">07 / 08</span>
+  </div>
+</div>
+
+<article class="page">
+
+  <header class="chapter-head fade-up">
+    <div class="chapter-number">VII.</div>
+    <div class="chapter-meta">
+      <div class="kicker">Chapter the Seventh</div>
+      <div>Lifecycle</div>
+    </div>
+    <h1 class="chapter-title">The Lifecycle of an Operation</h1>
+    <p class="chapter-subtitle">From <code>find_slot</code> through <code>apply_ubatch</code> to <code>update</code>. And the seq_* family that manipulates the cache between forward passes.</p>
+  </header>
+
+  <p class="lede fade-up d1">
+    The cache has a hot path and a cool path. The hot path runs every decode
+    step. The cool path runs only when sequences are created, forked, trimmed,
+    or shifted. Both are short. Both are interesting.
+  </p>
+
+  <p class="dropcap">A forward pass through the model consumes a <em>ubatch</em> — a small batch of tokens, each labelled with a position and a sequence id — and produces logits. From the cache's point of view, the work is to find a home for the new K and V vectors the model is about to compute, to write them there, and to update the metadata accordingly. This is the hot path. It is three function calls long.</p>
+
+  <h2 data-section="§ 7.1">The three-step waltz</h2>
+
+  <pre><span class="lbl">conceptual — one decode step</span><span class="cmt">// 1. find homes for the new tokens</span>
+slot_info slots = cache-&gt;<span class="fn">find_slot</span>(ubatch);
+
+<span class="cmt">// 2. commit the metadata: positions, sequences, shifts.</span>
+cache-&gt;<span class="fn">apply_ubatch</span>(slots, ubatch);
+
+<span class="cmt">// 3. run the model. it writes K, V into the slots and reads the mask.</span>
+<span class="fn">run_graph</span>(model, ubatch, cache);
+
+<span class="cmt">// 4. apply deferred work (k-shifts, stream copies, defrag).</span>
+cache-&gt;<span class="fn">update</span>();</pre>
+
+  <p>Step 1 is what we described in <a href="03-cells.html">Chapter III</a>: a scan over the cells for a viable run. Step 2 writes <code>pos</code>, <code>seq</code>, and <code>shift</code> for each slot the ubatch will fill, but does <em>not</em> touch the K and V tensors. Step 3 is the model running, which writes the actual K and V into the slots step 2 announced. Step 4 catches up on the deferred work — re-rotating K to absorb position shifts, copying data between streams when a previous <code>seq_cp</code> demanded it, and so on.</p>
+
+  <p>The split between steps 2 and 3 is deliberate. The cache cannot write K and V — only the model can, because only the model knows what they are. But the cache can commit to <em>where</em> they will go before the model runs, and that lets the surrounding code build the rest of the forward-pass graph with concrete tensor offsets baked in. The model's graph reads from a slot, writes to a slot, and the cache has the slot numbers ready.</p>
+
+  <h2 data-section="§ 7.2">prepare, the dry run</h2>
+
+  <p>For multi-ubatch workloads, the cache offers a <code>prepare</code> step that simulates several ubatches in advance. The motivation: when a large batch is split into N smaller ubatches by the batch driver, the cache needs to know that all N will fit before committing to the first one. A naive approach — find_slot for each ubatch in sequence, see if any fail — would mutate the metadata as it went, and would have to be rolled back on failure.</p>
+
+  <pre><span class="lbl">src/llama-kv-cache.cpp — line ~676</span>std::vector&lt;slot_info&gt; <span class="fn">prepare</span>(<span class="kw">const</span> std::vector&lt;ubatch&gt; &amp; ubatches) {
+    <span class="cmt">// snapshot the metadata grid</span>
+    <span class="kw">auto</span> snapshot = cells.<span class="fn">save</span>();
+
+    std::vector&lt;slot_info&gt; results;
+    <span class="kw">for</span> (<span class="kw">const</span> <span class="kw">auto</span> &amp; ub : ubatches) {
+        slot_info s = <span class="fn">find_slot</span>(ub);
+        <span class="kw">if</span> (s.<span class="fn">is_error</span>()) {
+            cells.<span class="fn">restore</span>(snapshot);   <span class="cmt">// roll back everything</span>
+            <span class="kw">return</span> {};
+        }
+        <span class="fn">apply_ubatch</span>(s, ub);          <span class="cmt">// temporarily — for the next find_slot</span>
+        results.push_back(s);
+    }
+
+    cells.<span class="fn">restore</span>(snapshot);          <span class="cmt">// undo the simulation</span>
+    <span class="kw">return</span> results;
+}</pre>
+
+  <p>The trick: simulate to find the slots, snapshot to undo the simulation, return the results, and let the caller commit the ubatches one by one for real. Because the metadata grid is short — a few arrays of length <code>kv_size</code> — saving and restoring it is cheap. Because the data tensors are never touched in this simulation, the gigabytes of cached K and V never move.</p>
+
+  <h2 data-section="§ 7.3">The seq_* family</h2>
+
+  <p>Between forward passes, the caller may manipulate sequences. The most useful operations form a small family. Each is a metadata-only operation in the unified-stream case; the per-stream case may queue a deferred data copy, as discussed in <a href="04-streams.html">Chapter IV</a>.</p>
+
+  <table>
+    <thead>
+      <tr><th>Operation</th><th>What it does</th><th>Touches data?</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>seq_rm(s, p0, p1)</code></td>
+        <td>remove sequence <em>s</em>'s ownership of cells in position range [p0, p1); cells with no remaining owners become empty.</td>
+        <td>no</td>
+      </tr>
+      <tr>
+        <td><code>seq_cp(s_src, s_dst, p0, p1)</code></td>
+        <td>add <em>s_dst</em> to the bitset of every cell in [p0, p1) that belongs to <em>s_src</em>. Fork in O(<em>k</em>).</td>
+        <td>only if cross-stream</td>
+      </tr>
+      <tr>
+        <td><code>seq_keep(s)</code></td>
+        <td>remove every sequence <em>except</em> <em>s</em> from every cell. Used to discard speculative branches.</td>
+        <td>no</td>
+      </tr>
+      <tr>
+        <td><code>seq_add(s, p0, p1, delta)</code></td>
+        <td>shift the cached positions of sequence <em>s</em> in [p0, p1) by <em>delta</em>. Used for sliding context windows.</td>
+        <td>only K, re-rotation deferred</td>
+      </tr>
+      <tr>
+        <td><code>seq_div(s, p0, p1, d)</code></td>
+        <td>divide cached positions by <em>d</em>. Used for context compression.</td>
+        <td>only K, re-rotation deferred</td>
+      </tr>
+      <tr>
+        <td><code>clear()</code></td>
+        <td>empty every cell.</td>
+        <td>no</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The two operations that <em>do</em> touch data — <code>seq_add</code> and <code>seq_div</code> — touch only K, and they touch it lazily. Each cell records the shift it has accumulated in the <code>shift</code> field; the next <code>update()</code> runs a graph that re-rotates the K of every cell with a non-zero shift, in place, on the device. The host never sees the rotated bytes. The V tensor needs no shift because V is invariant under position changes — it is K and Q that RoPE rotates.</p>
+
+  <aside class="margin">
+    <span class="ref">§ 7.3 — invariant</span>
+    Every <code>seq_*</code> operation that returns successfully leaves the cache in a state where the next <code>find_slot</code> will see consistent metadata. Failure modes (out of slots, invalid range) leave the cache untouched.
+  </aside>
+
+  <h2 data-section="§ 7.4">Defrag without copying</h2>
+
+  <p>A cache that has churned through many sequences may end up with its non-empty cells scattered through the slot space, with no contiguous run large enough for the next ubatch. The classical answer is defragmentation: move cells together to consolidate the free space.</p>
+
+  <p>The cache offers a defrag operation, but it is unusual. It does not move K and V. Instead, it re-numbers the metadata — assigns new slot indices to the existing tokens, in a packed layout — and emits a graph that permutes the K and V tensors on the device to match the new numbering. The host CPU does the bookkeeping; the device does the data motion. The bytes never cross the bus.</p>
+
+  <pre><span class="lbl">conceptual — defrag</span><span class="cmt">// 1. build a permutation that packs the used cells to the front</span>
+std::vector&lt;<span class="kw">uint32_t</span>&gt; perm = <span class="fn">build_pack_permutation</span>(cells);
+
+<span class="cmt">// 2. emit a graph that applies the permutation to every layer's K and V</span>
+<span class="kw">for</span> (<span class="kw">auto</span> &amp; layer : layers) {
+    graph.<span class="fn">add_permute</span>(layer.k, perm);
+    graph.<span class="fn">add_permute</span>(layer.v, perm);
+}
+
+<span class="cmt">// 3. update the metadata to reflect the new layout</span>
+cells.<span class="fn">apply_permutation</span>(perm);</pre>
+
+  <p>The same trick — let the device do the data motion, let the host do the bookkeeping — appears throughout the cache. Position shifts: shift the metadata, defer the K rotation to a device-side graph. Stream copies: queue them, run them in <code>update</code>. The cache, viewed this way, is a careful split between two kinds of state: a small, cheap, host-resident set of metadata that can be manipulated freely, and a large, expensive, device-resident set of data that is only ever transformed by graphs.</p>
+
+  <h2 data-section="§ 7.5">apply_ubatch and the overlap rule</h2>
+
+  <p>One subtle case in step 2 of the waltz is worth examining. When the cache commits a ubatch into a slot range, what happens if some of the slots in that range were not empty — if, for example, the SWA-aware allocator chose to reclaim cells that had fallen out of the window? The answer is that <code>apply_ubatch</code> overwrites them: the previous owners (who had been masked out by SWA anyway) are evicted, the new positions and sequences are written, and the cells become the new ubatch's. The data tensors will be overwritten in step 3 by the model.</p>
+
+  <pre><span class="lbl">src/llama-kv-cache.cpp — line ~1017</span><span class="kw">void</span> <span class="fn">apply_ubatch</span>(<span class="kw">const</span> slot_info &amp; s, <span class="kw">const</span> ubatch &amp; ub) {
+    <span class="kw">for</span> (<span class="typ">uint32_t</span> i = 0; i &lt; ub.n_tokens; ++i) {
+        <span class="kw">const</span> <span class="typ">uint32_t</span> slot = s.start + i;
+
+        <span class="cmt">// if the slot was previously occupied, drop the old owner.</span>
+        <span class="kw">if</span> (cells.pos[slot] != -1) {
+            cells.<span class="fn">evict</span>(slot);
+        }
+
+        cells.pos[slot]    = ub.pos[i];
+        cells.seq[slot]    = ub.seq_id[i];
+        cells.shift[slot]  = 0;
+        cells.<span class="fn">mark_used</span>(slot);
+    }
+}</pre>
+
+  <p>The eviction is, again, metadata-only. The cell's old K and V will be overwritten by the model's graph in step 3; until then, the bytes are stale but invisible — the mask will treat the slot as belonging to the new sequence at the new position.</p>
+
+  <h2 data-section="§ 7.6">What runs in update</h2>
+
+  <p>The final step, <code>update()</code>, is the cache's cleanup pass. It handles:</p>
+
+  <ul class="dashes">
+    <li><strong>k-shifts</strong> — re-rotate K for cells whose <code>shift</code> field is non-zero, then clear those shifts.</li>
+    <li><strong>stream copies</strong> — execute any <code>sc_info</code> entries that <code>seq_cp</code> queued, copying K and V from source stream cells to destination stream cells via <code>ggml_backend_tensor_copy</code>.</li>
+    <li><strong>defrag</strong> — if requested, run the permutation graph described above.</li>
+  </ul>
+
+  <p>If none of those are pending, <code>update</code> is a no-op. In the steady-state decoding of a single sequence, it usually is.</p>
+
+  <div class="callout">
+    <span class="label">Summary of the dance</span>
+    <p>find_slot → apply_ubatch → run model → update. Repeat. The first two are metadata work; the third is the model's. The fourth is deferred device work. The hot path of a 200-token-per-second decode loop spends almost all its time in step 3 and is essentially free in 1, 2, and 4.</p>
+  </div>
+
+  <p>One chapter remains. It picks up several threads we've left dangling — what <em>type_k</em> and <em>type_v</em> let you do, how multi-token-prediction heads share the cache with the trunk model, what the hybrid memory wrappers are for. These are the recent additions, and they are where the cache is going.</p>
+
+  <nav class="footer-nav">
+    <a href="06-mask.html" class="prev">
+      <span class="label">Chapter VI</span>
+      <span class="ttl">Building the Mask</span>
+    </a>
+    <a href="08-beyond.html" class="next">
+      <span class="label">Chapter VIII</span>
+      <span class="ttl">Quantization &amp; Beyond</span>
+    </a>
+  </nav>
+
+</article>
+
+</body>
+</html>
