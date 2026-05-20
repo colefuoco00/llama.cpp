@@ -310,7 +310,7 @@
 <!--                            COVER                              -->
 <!-- ============================================================ -->
 <section class="cover">
-  <div class="cover-eyebrow fade-up">Three short monographs, one codebase</div>
+  <div class="cover-eyebrow fade-up">Four short monographs, one codebase</div>
 
   <h1 class="cover-title fade-up d1">
     Notes on<br>
@@ -325,7 +325,7 @@
   </p>
 
   <div class="cover-meta fade-up d4">
-    <div class="item"><span class="k">Works</span><span class="v">Three</span></div>
+    <div class="item"><span class="k">Works</span><span class="v">Four</span></div>
     <div class="item"><span class="k">Source</span><span class="v">llama.cpp tree</span></div>
     <div class="item"><span class="k">Audience</span><span class="v">Implementers</span></div>
   </div>
@@ -337,7 +337,7 @@
 <section class="catalogue">
   <div class="catalogue-label">
     <span>Catalogue</span>
-    <span>I — III</span>
+    <span>I — IV</span>
   </div>
 
   <ol class="works">
@@ -464,7 +464,71 @@
       </div>
     </li>
 
-    <!-- ====== III. Importance Matrix ====== -->
+    <!-- ====== III. Meta Backend ====== -->
+    <li onclick="location.href='meta-backend.html'">
+      <div class="glyph" aria-hidden="true">
+        <svg viewBox="0 0 200 150" xmlns="http://www.w3.org/2000/svg">
+          <rect width="200" height="150" fill="#e7decb"/>
+          <!-- four devices -->
+          <g stroke="#1a1715" stroke-width="0.9">
+            <rect x="18"  y="22" width="34" height="34" fill="#d8c8a0"/>
+            <rect x="58"  y="22" width="34" height="34" fill="#b8c8a0"/>
+            <rect x="98"  y="22" width="34" height="34" fill="#b9c4d6"/>
+            <rect x="138" y="22" width="34" height="34" fill="#e5b6a0"/>
+          </g>
+          <g font-family="JetBrains Mono, monospace" font-size="9" fill="#1a1715" letter-spacing="0.06em" text-anchor="middle">
+            <text x="35" y="44">d0</text>
+            <text x="75" y="44">d1</text>
+            <text x="115" y="44">d2</text>
+            <text x="155" y="44">d3</text>
+          </g>
+          <!-- meta device wrapping -->
+          <rect x="12" y="14" width="170" height="52" fill="none" stroke="#b73a26" stroke-width="1.4" stroke-dasharray="3 3"/>
+          <text x="100" y="80" font-family="JetBrains Mono, monospace" font-size="8" fill="#b73a26" letter-spacing="0.2em" text-anchor="middle">META</text>
+          <!-- allreduce arrows: butterfly -->
+          <g stroke="#7a3a1c" stroke-width="1.2" fill="none">
+            <path d="M 35 96 Q 55 110 75 96"/>
+            <path d="M 115 96 Q 135 110 155 96"/>
+            <path d="M 35 116 Q 75 132 115 116"/>
+            <path d="M 75 116 Q 115 132 155 116"/>
+          </g>
+          <g fill="#7a3a1c">
+            <polygon points="75,96 70,90 72,96"/>
+            <polygon points="155,96 150,90 152,96"/>
+            <polygon points="115,116 110,110 112,116"/>
+            <polygon points="155,116 150,110 152,116"/>
+          </g>
+          <text x="20" y="105" font-family="JetBrains Mono, monospace" font-size="7" fill="#3a342c" letter-spacing="0.14em">⊕</text>
+          <text x="20" y="125" font-family="JetBrains Mono, monospace" font-size="7" fill="#3a342c" letter-spacing="0.14em">⊕</text>
+        </svg>
+      </div>
+
+      <div class="body">
+        <div class="kicker"><span class="num">III.</span>One monograph · interactive · ~53 KB</div>
+        <a class="title-link" href="meta-backend.html">
+          <h2>The <em>Meta</em> Backend</h2>
+        </a>
+        <p class="blurb">
+          A virtual device that wraps a fleet of real ones, classifies every tensor by
+          how it is sharded, and decides when partial sums need to meet. ggml's tensor-parallelism
+          machinery in one file.
+        </p>
+        <ul class="ttls">
+          <li>Split states</li>
+          <li>Per-op inference</li>
+          <li>Subgraph partitioning</li>
+          <li>Butterfly AllReduce</li>
+          <li>MoE delay peephole</li>
+        </ul>
+      </div>
+
+      <div class="right">
+        <span class="pg">Vol. III</span>
+        <a class="read" href="meta-backend.html" onclick="event.stopPropagation()">Read</a>
+      </div>
+    </li>
+
+    <!-- ====== IV. Importance Matrix ====== -->
     <li onclick="location.href='imatrix.html'">
       <div class="glyph" aria-hidden="true">
         <svg viewBox="0 0 200 150" xmlns="http://www.w3.org/2000/svg">
@@ -549,7 +613,7 @@
       </div>
 
       <div class="body">
-        <div class="kicker"><span class="num">III.</span>One note · ~27 KB</div>
+        <div class="kicker"><span class="num">IV.</span>One note · ~27 KB</div>
         <a class="title-link" href="imatrix.html">
           <h2>The <em>Importance</em> Matrix</h2>
         </a>
@@ -566,7 +630,7 @@
       </div>
 
       <div class="right">
-        <span class="pg">Vol. III</span>
+        <span class="pg">Vol. IV</span>
         <a class="read" href="imatrix.html" onclick="event.stopPropagation()">Read</a>
       </div>
     </li>
@@ -578,8 +642,9 @@
   <p>
     Set in <em>Fraunces</em> and <em>Newsreader</em>, with <em>JetBrains Mono</em> for code.
     Source lives in this repository under <code>kv-cache-explainer/</code>,
-    <code>recurrent-cache.html</code>, and <code>imatrix.html</code>. Each work
-    is self-contained and reads cold; the catalogue above is only a suggested order.
+    <code>recurrent-cache.html</code>, <code>meta-backend.html</code>, and
+    <code>imatrix.html</code>. Each work is self-contained and reads cold; the
+    catalogue above is only a suggested order.
   </p>
 </section>
 

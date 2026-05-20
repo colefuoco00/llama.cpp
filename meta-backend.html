@@ -1,0 +1,1047 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Meta Backend — ggml multi-device tensor parallelism</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT@9..144,300..900,0..100&family=Newsreader:ital,opsz,wght@0,6..72,200..800;1,6..72,200..800&family=JetBrains+Mono:wght@300..700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper:       #f1e9d4;
+    --paper-2:     #e7decb;
+    --paper-3:     #ddd2b8;
+    --paper-4:     #d5c9a4;
+    --ink:         #1a1715;
+    --ink-soft:    #3a342c;
+    --rule:        #c8b890;
+    --rule-soft:   #d8caa8;
+    --accent:      #b73a26;
+    --accent-2:    #7a3a1c;
+    --slate:       #354152;
+    --mute:        #8d7e5c;
+    --highlight:   #f7e9a8;
+    --code-bg:     #e6dcbe;
+    --code-border: #c8b890;
+    --good:        #4a6b2e;
+    --teal:        #2e6b6b;
+    --indigo:      #3b4a7a;
+
+    --display:  'Fraunces','EB Garamond',Georgia,serif;
+    --body:     'Newsreader','EB Garamond',Georgia,serif;
+    --mono:     'JetBrains Mono','IBM Plex Mono','Menlo',monospace;
+
+    --main-col:   46rem;
+    --margin-col: 14rem;
+    --gutter:     2.25rem;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 18px;
+    line-height: 1.62;
+    font-feature-settings: "kern","liga","onum";
+    background-image:
+      radial-gradient(ellipse 80% 60% at 10% 0%, rgba(255,255,255,.45) 0%, transparent 60%),
+      radial-gradient(ellipse 60% 50% at 100% 100%, rgba(120,90,40,.06) 0%, transparent 60%),
+      repeating-linear-gradient(0deg, transparent 0, transparent 2px, rgba(50,30,10,.012) 2px, rgba(50,30,10,.012) 3px);
+  }
+
+  .running-head {
+    position: sticky; top: 0; z-index: 50;
+    background: var(--paper);
+    border-bottom: 1px solid var(--ink);
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.18em; text-transform: uppercase;
+  }
+  .running-head .inner {
+    max-width: calc(var(--main-col) + var(--margin-col) + var(--gutter) + 4rem);
+    margin: 0 auto; padding: 0.65rem 2rem;
+    display: flex; justify-content: space-between; align-items: baseline; gap: 1rem;
+  }
+  .running-head .title { color: var(--accent); font-weight: 600; }
+  .running-head .folio { color: var(--ink-soft); }
+
+  .page {
+    max-width: calc(var(--main-col) + var(--margin-col) + var(--gutter) + 4rem);
+    margin: 0 auto; padding: 4rem 2rem 6rem;
+    display: grid;
+    grid-template-columns: var(--main-col) var(--margin-col);
+    column-gap: var(--gutter);
+    align-items: start;
+  }
+  .page > * { grid-column: 1; }
+  .page > aside.margin { grid-column: 2; }
+  .page > .full { grid-column: 1 / -1; }
+
+  .chapter-head {
+    margin-top: 1rem; margin-bottom: 3.5rem;
+    border-bottom: 1px solid var(--ink); padding-bottom: 1.5rem;
+    display: grid; grid-template-columns: auto 1fr;
+    column-gap: 2.25rem; align-items: end;
+  }
+  .chapter-number {
+    font-family: var(--display); font-style: italic; font-weight: 300;
+    font-size: clamp(4rem, 9vw, 7.5rem); line-height: 0.9;
+    color: var(--accent);
+    font-variation-settings: "opsz" 144, "SOFT" 100;
+    letter-spacing: -0.02em;
+  }
+  .chapter-meta {
+    text-align: right; font-family: var(--mono);
+    font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--ink-soft);
+  }
+  .chapter-meta .kicker { color: var(--accent); }
+
+  .chapter-title {
+    grid-column: 1/-1;
+    font-family: var(--display); font-weight: 400;
+    font-size: clamp(2.4rem, 5.5vw, 4rem); line-height: 1.02;
+    letter-spacing: -0.018em; margin: 0.5rem 0 0;
+    font-variation-settings: "opsz" 144, "SOFT" 30;
+  }
+  .chapter-subtitle {
+    grid-column: 1/-1; font-family: var(--body); font-style: italic;
+    font-weight: 300; color: var(--ink-soft);
+    font-size: 1.2rem; line-height: 1.4; margin: 0.85rem 0 0; max-width: 38rem;
+  }
+
+  h2 {
+    font-family: var(--display); font-weight: 500;
+    font-size: 1.6rem; letter-spacing: -0.012em;
+    margin: 3.5rem 0 0.8rem;
+    font-variation-settings: "opsz" 60;
+    position: relative;
+  }
+  h2::before {
+    content: attr(data-section);
+    position: absolute; left: -3.4rem; top: 0.45rem;
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.18em; color: var(--accent); font-weight: 500;
+  }
+  h3 {
+    font-family: var(--display); font-weight: 500; font-style: italic;
+    font-size: 1.2rem; margin: 2.2rem 0 0.5rem;
+    color: var(--ink); font-variation-settings: "opsz" 36, "SOFT" 60;
+  }
+
+  p { margin: 0 0 1.05em; hyphens: auto; text-align: justify; }
+  p + p { text-indent: 1.4em; }
+  p.lede {
+    font-size: 1.18rem; line-height: 1.5;
+    color: var(--ink-soft); font-style: italic;
+    margin-bottom: 2rem; text-indent: 0; text-align: left;
+  }
+  p.lede + p { text-indent: 0; }
+  p.dropcap::first-letter {
+    font-family: var(--display); font-weight: 600;
+    font-size: 4.6em; line-height: 0.82;
+    float: left; margin: 0.06em 0.08em 0 -0.04em;
+    color: var(--accent); font-variation-settings: "opsz" 144, "SOFT" 0;
+  }
+  strong { font-weight: 600; color: var(--ink); }
+  em     { font-style: italic; }
+  .term  { font-style: italic; color: var(--accent-2); }
+  a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--rule); }
+  a:hover { border-bottom-color: var(--accent); }
+
+  code {
+    font-family: var(--mono); font-size: 0.86em;
+    background: var(--code-bg); padding: 0.05em 0.3em; border-radius: 2px;
+    font-feature-settings: "calt" 0;
+  }
+  pre {
+    font-family: var(--mono); font-size: 13px; line-height: 1.55;
+    background: var(--code-bg);
+    border: 1px solid var(--code-border); border-left: 3px solid var(--accent);
+    padding: 1rem 1.2rem; margin: 1.5rem 0;
+    overflow-x: auto; white-space: pre; position: relative;
+  }
+  pre code { background: transparent; padding: 0; }
+  pre .cmt { color: var(--mute); font-style: italic; }
+  pre .kw  { color: var(--accent); }
+  pre .typ { color: var(--slate); font-weight: 500; }
+  pre .str { color: var(--good); }
+  pre .num { color: var(--accent-2); }
+  pre .fn  { color: var(--ink); font-weight: 600; }
+  pre .lbl {
+    position: absolute; top: -10px; right: 12px;
+    background: var(--paper); padding: 0 0.5rem;
+    font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--ink-soft); border: 1px solid var(--code-border);
+  }
+
+  aside.margin {
+    font-family: var(--body); font-size: 14px; line-height: 1.45;
+    color: var(--ink-soft); font-style: italic;
+    border-top: 1px solid var(--ink); padding-top: 0.45rem; margin-top: 0.5rem;
+  }
+  aside.margin .ref {
+    display: block; font-family: var(--mono); font-style: normal;
+    font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 0.4rem;
+  }
+
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--paper-2);
+    padding: 1rem 1.25rem; margin: 1.5rem 0;
+    font-size: 0.96em;
+  }
+  .callout .label {
+    display: inline-block; font-family: var(--mono);
+    font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 0.4rem;
+  }
+  .callout p:last-child { margin-bottom: 0; }
+
+  figure { margin: 2.5rem 0; grid-column: 1 / -1; }
+  figure svg { display: block; max-width: 100%; height: auto; }
+  figcaption {
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-soft);
+    margin-top: 0.8rem; padding-top: 0.5rem; border-top: 1px solid var(--rule);
+    display: flex; justify-content: space-between; align-items: baseline; gap: 1rem;
+  }
+  figcaption .fig-num { color: var(--accent); flex-shrink: 0; }
+  figcaption .fig-desc {
+    text-transform: none; letter-spacing: 0; font-style: italic;
+    font-family: var(--body); font-size: 13px; color: var(--ink-soft);
+    text-align: right; flex: 1;
+  }
+
+  ul, ol { padding-left: 1.4em; margin: 0 0 1.2em; }
+  li { margin-bottom: 0.45em; }
+  ul.dashes { list-style: none; padding-left: 0; }
+  ul.dashes li { position: relative; padding-left: 1.6em; }
+  ul.dashes li::before {
+    content: '—'; position: absolute; left: 0;
+    color: var(--accent); font-weight: 500;
+  }
+
+  .diagram-frame {
+    border: 1px solid var(--ink);
+    background:
+      repeating-linear-gradient(0deg, transparent 0, transparent 22px, rgba(40,30,10,.04) 22px, rgba(40,30,10,.04) 23px),
+      var(--paper-2);
+    padding: 1.5rem;
+  }
+  .dg-text       { font-family: var(--mono); font-size: 11px; fill: var(--ink); letter-spacing: 0.04em; }
+  .dg-label      { font-family: var(--mono); font-size: 10px; fill: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.14em; }
+  .dg-title      { font-family: var(--display); font-style: italic; fill: var(--accent); font-size: 15px; }
+  .dg-stroke     { stroke: var(--ink); fill: none; stroke-width: 1.2; }
+  .dg-stroke-soft{ stroke: var(--rule-soft); fill: none; stroke-width: 1; }
+  .dg-accent     { stroke: var(--accent); fill: none; stroke-width: 1.4; }
+  .dg-fill       { fill: var(--paper); stroke: var(--ink); stroke-width: 1; }
+  .dg-fill-soft  { fill: var(--paper-2); stroke: var(--ink); stroke-width: 1; }
+  .dg-dashed     { stroke-dasharray: 3 3; }
+
+  /* ====== device palette ====== */
+  .d-fill-0 { fill: #d8c8a0; }
+  .d-fill-1 { fill: #b8c8a0; }
+  .d-fill-2 { fill: #b9c4d6; }
+  .d-fill-3 { fill: #e5b6a0; }
+  .d-fill-mirror { fill: #f0e2b4; }
+  .d-fill-partial { fill: repeating-linear-gradient(45deg, #d8c8a0 0, #d8c8a0 6px, #e5b6a0 6px, #e5b6a0 12px); }
+
+  /* ====== controls ====== */
+  .controls {
+    display: flex; gap: 0.6rem; align-items: center;
+    margin-top: 0.75rem; flex-wrap: wrap;
+  }
+  .controls button {
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    background: var(--paper); border: 1px solid var(--ink); color: var(--ink);
+    padding: 0.5rem 0.95rem; cursor: pointer; transition: all 120ms;
+  }
+  .controls button:hover { background: var(--ink); color: var(--paper); }
+  .controls button.active, .controls button.primary {
+    background: var(--accent); color: var(--paper); border-color: var(--accent);
+  }
+  .controls button.primary:hover { background: var(--accent-2); border-color: var(--accent-2); }
+  .controls button:disabled { opacity: 0.35; cursor: not-allowed; }
+  .controls .status {
+    font-family: var(--mono); font-size: 11px;
+    color: var(--ink-soft); margin-left: auto;
+  }
+  .controls select {
+    font-family: var(--mono); font-size: 11px;
+    border: 1px solid var(--ink); padding: 0.4rem 0.5rem;
+    background: var(--paper); color: var(--ink);
+    text-transform: uppercase; letter-spacing: 0.1em;
+  }
+  .controls .lbl {
+    font-family: var(--mono); font-size: 10px;
+    letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--ink-soft);
+  }
+
+  /* split-state row */
+  .split-grid {
+    display: grid;
+    grid-template-columns: 8rem 1fr;
+    align-items: stretch;
+    gap: 0.75rem;
+    margin: 0.6rem 0;
+    font-family: var(--mono);
+  }
+  .split-grid .axisname {
+    padding: 0.55rem 0.7rem;
+    font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
+    border-right: 2px solid var(--accent);
+    color: var(--ink-soft);
+    display: flex; flex-direction: column; justify-content: center;
+    background: rgba(247,233,168,0.32);
+  }
+  .split-grid .axisname .ttl { color: var(--accent); font-weight: 600; font-size: 12px; }
+
+  .tensor-row {
+    display: flex; gap: 6px; align-items: stretch;
+  }
+  .tensor-row .seg {
+    flex: 1; min-height: 38px;
+    border: 1px solid var(--ink);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; letter-spacing: 0.08em;
+    color: var(--ink-soft);
+    text-transform: uppercase;
+  }
+  .seg.d0 { background: #d8c8a0; }
+  .seg.d1 { background: #b8c8a0; }
+  .seg.d2 { background: #b9c4d6; }
+  .seg.d3 { background: #e5b6a0; }
+  .seg.mirror {
+    background:
+      repeating-linear-gradient(45deg, #f0e2b4 0, #f0e2b4 5px, #e6d49a 5px, #e6d49a 10px);
+  }
+  .seg.partial {
+    background:
+      repeating-linear-gradient(45deg, #d8c8a0 0, #d8c8a0 5px, #e5b6a0 5px, #e5b6a0 10px);
+  }
+
+  /* mul_mat propagator */
+  .propagator {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 1rem;
+    align-items: center;
+    margin: 1rem 0;
+  }
+  .prop-cell {
+    background: var(--paper);
+    border: 1px solid var(--ink);
+    padding: 0.8rem;
+    display: flex; flex-direction: column; gap: 0.5rem;
+  }
+  .prop-cell .heading {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+  }
+  .prop-cell .axis-tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    background: var(--accent);
+    color: var(--paper);
+    padding: 0.2rem 0.5rem;
+    display: inline-block;
+    letter-spacing: 0.08em;
+    width: fit-content;
+  }
+  .prop-cell.partial .axis-tag { background: var(--accent-2); }
+  .prop-cell .visual { aspect-ratio: 1.5; display: flex; align-items: stretch; gap: 3px; }
+  .prop-arrow {
+    font-family: var(--display);
+    font-size: 2rem;
+    color: var(--accent);
+    font-style: italic;
+    text-align: center;
+  }
+
+  /* butterfly */
+  .butterfly {
+    display: grid;
+    grid-template-columns: 5rem repeat(3, 1fr);
+    gap: 0.5rem;
+    align-items: stretch;
+    font-family: var(--mono);
+  }
+  .bf-rowlbl {
+    font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--ink-soft);
+    display: flex; align-items: center; justify-content: flex-end;
+    padding-right: 0.5rem;
+    border-right: 1px solid var(--rule);
+  }
+  .bf-cell {
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    padding: 0.4rem 0.5rem;
+    min-height: 3.5rem;
+    display: flex; flex-direction: column;
+    gap: 0.2rem;
+    font-size: 11px;
+    transition: all 200ms ease;
+  }
+  .bf-cell.recv { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .bf-cell .pid {
+    font-size: 9px; letter-spacing: 0.12em;
+    color: var(--ink-soft); text-transform: uppercase;
+  }
+  .bf-cell .val {
+    font-size: 12px; color: var(--ink);
+    font-weight: 600;
+  }
+  .bf-headcol {
+    text-align: center;
+    font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--accent);
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--ink);
+  }
+
+  /* op table */
+  table.optable {
+    width: 100%; border-collapse: collapse;
+    margin: 1.5rem 0;
+    font-family: var(--mono); font-size: 12px;
+  }
+  table.optable th, table.optable td {
+    padding: 0.45rem 0.7rem; text-align: left;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  table.optable th {
+    font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent); font-weight: 600; border-bottom: 1px solid var(--ink);
+  }
+  table.optable tr:last-child td { border-bottom: 1px solid var(--ink); }
+  table.optable td code { font-size: 11px; }
+
+  .legend {
+    display: flex; gap: 1.2rem; flex-wrap: wrap;
+    font-family: var(--mono); font-size: 11px;
+    color: var(--ink-soft); margin-top: 0.6rem;
+    letter-spacing: 0.06em;
+  }
+  .legend .item { display: inline-flex; align-items: center; gap: 0.45rem; }
+  .legend .sw {
+    width: 16px; height: 16px; border: 1px solid var(--ink); display: inline-block;
+  }
+  .legend .sw.mirror {
+    background: repeating-linear-gradient(45deg, #f0e2b4 0, #f0e2b4 4px, #e6d49a 4px, #e6d49a 8px);
+  }
+  .legend .sw.partial {
+    background: repeating-linear-gradient(45deg, #d8c8a0 0, #d8c8a0 4px, #e5b6a0 4px, #e5b6a0 8px);
+  }
+
+  @keyframes fadeUp { from{opacity:0;transform:translateY(8px);} to{opacity:1;transform:translateY(0);} }
+  .fade-up { animation: fadeUp 600ms cubic-bezier(.22,1,.36,1) both; }
+  .fade-up.d1{animation-delay:80ms;} .fade-up.d2{animation-delay:160ms;}
+  .fade-up.d3{animation-delay:240ms;} .fade-up.d4{animation-delay:320ms;}
+
+  @media (max-width: 960px) {
+    :root { --main-col: 1fr; --margin-col: 0; --gutter: 0; }
+    .page { grid-template-columns: 1fr; padding: 2rem 1.25rem 4rem; }
+    .page > aside.margin {
+      grid-column: 1; border-top: none;
+      border-left: 3px solid var(--accent);
+      padding: 0.6rem 0.9rem; margin: 1.5rem 0;
+      background: var(--paper-2);
+    }
+    h2::before { position: static; display: block; margin-bottom: 0.3rem; }
+    .chapter-head { grid-template-columns: 1fr; }
+    .chapter-meta { text-align: left; }
+    .propagator { grid-template-columns: 1fr; }
+    .prop-arrow { transform: rotate(90deg); }
+    .butterfly { grid-template-columns: 4rem repeat(3, 1fr); }
+    body { font-size: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="running-head">
+  <div class="inner">
+    <span class="title">The Meta Backend</span>
+    <span class="folio">ggml/src/ggml-backend-meta.cpp</span>
+  </div>
+</div>
+
+<article class="page">
+
+  <header class="chapter-head fade-up">
+    <div class="chapter-number">M.</div>
+    <div class="chapter-meta">
+      <div class="kicker">A short engineering monograph</div>
+      <div>Many devices, one address space</div>
+    </div>
+    <h1 class="chapter-title">The Meta Backend</h1>
+    <p class="chapter-subtitle">A virtual device that wraps a fleet of real devices, hides the sharding from the scheduler, and decides when the partial sums on each card need to meet.</p>
+  </header>
+
+  <p class="lede fade-up d1">
+    Tensor parallelism, in ggml, is not a runtime feature you opt into. It is a <em>backend</em>
+    you ask the scheduler to use, and the trick is that the backend appears to be a single
+    device while owning a row of them.
+  </p>
+
+  <p class="dropcap">The meta backend is ggml's answer to multi-GPU. From the outside it presents the ordinary backend interface: a device, a buffer type, a buffer, a graph_compute. From the inside, each of those is a thin shell wrapping a vector of <em>simple</em> backends — one per physical device — together with the bookkeeping that decides, for every tensor flowing through the graph, how it is split across them. A mul_mat node fans out into <em>N</em> parallel mul_mats on <em>N</em> devices, each operating on a slice; the slices are then either disjoint pieces of the output, or partial sums that an AllReduce will fold together. The scheduler does not see any of this. It hands the meta backend a graph and gets a result.</p>
+
+  <p>This page walks the seams of that abstraction. There are four pieces to know: the <em>split state</em> that classifies every tensor's distribution across devices; the per-op handlers that derive output splits from input splits; the graph-compute driver that breaks the work into subgraphs at AllReduce boundaries; and the reduction itself, which is either backend-native (NCCL) or a butterfly fallback woven out of ordinary ggml graph nodes.</p>
+
+  <aside class="margin">
+    <span class="ref">scope</span>
+    Everything here is in one file: <code>ggml/src/ggml-backend-meta.cpp</code> (~2,100 lines). The public surface is in <code>ggml-backend.h</code>: a single device-creation entry point, an enum of split axes, and a callback the caller supplies to assign split states for parameter tensors.
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ M.1">A device that is several devices</h2>
+
+  <p>The construction is a curried call. You hand the meta backend a list of simple devices — <em>k</em> CUDA cards, two Metal devices, a CPU plus a Vulkan card, whatever the registry offers — together with a callback that will be invoked, later, for each parameter tensor to ask how it should be split:</p>
+
+  <pre><span class="lbl">ggml/include/ggml-backend.h — line ~398</span><span class="kw">GGML_API</span> ggml_backend_dev_t <span class="fn">ggml_backend_meta_device</span>(
+    ggml_backend_dev_t <span class="op">*</span> devs, <span class="typ">size_t</span> n_devs,
+    ggml_backend_meta_get_split_state_t get_split_state,
+    <span class="kw">void</span> <span class="op">*</span> get_split_state_ud);</pre>
+
+  <p>The returned <code>dev</code> behaves like any other device: it advertises a name (the concatenation of its members), an aggregate memory budget (the sum), a buffer type (a meta buffer type that delegates to each simple buffer type underneath), and a set of capabilities computed as the intersection of its members'. From the scheduler's point of view, the meta device is a single device and the only one it sees.</p>
+
+  <p>The interesting work happens when a tensor is allocated. The meta buffer holds <em>N</em> simple buffers (one per device, each backed by that device's allocator) and a map from <code>ggml_tensor *</code> to a vector of <em>N</em> simple tensors. The simple tensors are real, allocated, address-bearing — one per device, dimensioned according to that device's slice. The high-level tensor that the rest of ggml sees is a wrapper that resolves into its <em>j</em>-th physical incarnation when a backend operation needs to touch the data on device <em>j</em>.</p>
+
+  <aside class="margin">
+    <span class="ref">§ M.1 — buffer math</span>
+    A meta buffer's <em>alignment</em> is the LCM of its members' alignments (asserted to actually be a common multiple). Its <em>max_size</em> is the minimum across members. Its <em>alloc_size</em> per tensor is the max — overcommitted, because not every slice has the same shape after the split.
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ M.2">Five ways a tensor can be split</h2>
+
+  <p>Every tensor flowing through a meta-backend graph has a <em>split state</em>: how it is laid out across the simple devices. The axis is one of five values (with two bookkeeping sentinels):</p>
+
+  <div class="full">
+    <div class="diagram-frame">
+      <div style="font-family:var(--mono); font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:var(--ink-soft); margin-bottom:.7rem;">
+        Five split states, on a 4-device meta backend
+      </div>
+
+      <div class="split-grid">
+        <div class="axisname">
+          <div class="ttl">AXIS_0</div>
+          <div>row split</div>
+        </div>
+        <div class="tensor-row">
+          <div class="seg d0">device 0</div>
+          <div class="seg d1">device 1</div>
+          <div class="seg d2">device 2</div>
+          <div class="seg d3">device 3</div>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="axisname">
+          <div class="ttl">AXIS_1</div>
+          <div>column split</div>
+        </div>
+        <div class="tensor-row" style="flex-direction:column">
+          <div class="seg d0" style="min-height:18px">device 0</div>
+          <div class="seg d1" style="min-height:18px">device 1</div>
+          <div class="seg d2" style="min-height:18px">device 2</div>
+          <div class="seg d3" style="min-height:18px">device 3</div>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="axisname">
+          <div class="ttl">AXIS_2 / 3</div>
+          <div>batch / head split</div>
+        </div>
+        <div class="tensor-row">
+          <div class="seg d0" style="flex:1">d0 · batch 0</div>
+          <div class="seg d1" style="flex:1">d1 · batch 1</div>
+          <div class="seg d2" style="flex:1">d2 · batch 2</div>
+          <div class="seg d3" style="flex:1">d3 · batch 3</div>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="axisname">
+          <div class="ttl">MIRRORED</div>
+          <div>full on every device</div>
+        </div>
+        <div class="tensor-row">
+          <div class="seg mirror" style="flex:1">d0 · full</div>
+          <div class="seg mirror" style="flex:1">d1 · full</div>
+          <div class="seg mirror" style="flex:1">d2 · full</div>
+          <div class="seg mirror" style="flex:1">d3 · full</div>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="axisname">
+          <div class="ttl">PARTIAL</div>
+          <div>partial sums pending</div>
+        </div>
+        <div class="tensor-row">
+          <div class="seg partial" style="flex:1">d0 · partial</div>
+          <div class="seg partial" style="flex:1">d1 · partial</div>
+          <div class="seg partial" style="flex:1">d2 · partial</div>
+          <div class="seg partial" style="flex:1">d3 · partial</div>
+        </div>
+      </div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:#d8c8a0"></span> device 0</span>
+        <span class="item"><span class="sw" style="background:#b8c8a0"></span> device 1</span>
+        <span class="item"><span class="sw" style="background:#b9c4d6"></span> device 2</span>
+        <span class="item"><span class="sw" style="background:#e5b6a0"></span> device 3</span>
+        <span class="item"><span class="sw mirror"></span> mirrored copy</span>
+        <span class="item"><span class="sw partial"></span> partial sum</span>
+      </div>
+    </div>
+  </div>
+
+  <ul class="dashes">
+    <li><strong>AXIS_0..3</strong> — the tensor is split along that ggml dimension. Each device owns a contiguous slice. For most tensors this is one segment; QKV-fused matrices use multiple segments so that each device gets a piece of Q, K, <em>and</em> V.</li>
+    <li><strong>MIRRORED</strong> — every device holds the full tensor. Used for activations that are cheap enough to broadcast, and for small parameters (norms, biases).</li>
+    <li><strong>PARTIAL</strong> — each device holds an addend; the logical tensor is their sum. This is the state immediately after a mul_mat that reduces along the split axis, and the only state that requires an AllReduce to be made consumable again.</li>
+    <li><strong>NONE / UNKNOWN</strong> — internal sentinels used by the inference logic to signal "no decision yet" and "contradiction"; never the final state of a tensor.</li>
+  </ul>
+
+  <aside class="margin">
+    <span class="ref">§ M.2 — segments</span>
+    A tensor can have more than one <em>segment</em> when its layout is inhomogeneous along the split axis — fused QKV is the canonical example. Each segment carries its own per-device <code>ne</code> array, so device <em>j</em> ends up with a slice of Q, a slice of K, and a slice of V at the right offsets.
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ M.3">Inferring the split, op by op</h2>
+
+  <p>Parameter tensors have their split assigned externally — the caller supplies a function that, given the tensor, returns a split state. Activations, in contrast, derive their split from the op that produced them. The function <code>ggml_backend_meta_get_split_state</code> is a long switch over op codes, each branch a small inference rule:</p>
+
+  <table class="optable">
+    <thead><tr><th>op</th><th>rule</th><th>typical case</th></tr></thead>
+    <tbody>
+      <tr><td><code>MUL_MAT</code></td><td>see propagator below</td><td>row × mirror → row · row × row → partial</td></tr>
+      <tr><td><code>ADD</code>, <code>MUL</code>, <code>SUB</code> (bin)</td><td>follow src[0] if shapes agree, else fail</td><td>partial + mirrored bias → partial</td></tr>
+      <tr><td><code>VIEW</code>, <code>RESHAPE</code></td><td>map old axis → new axis preserving contiguity</td><td>row-split kept across a reshape that doesn't cross row boundary</td></tr>
+      <tr><td><code>PERMUTE</code></td><td>look up the axis through <code>op_params</code></td><td>axis k → axis op_params[k]</td></tr>
+      <tr><td><code>TRANSPOSE</code></td><td>swap 0 ↔ 1; keep 2, 3, mirrored, partial</td><td>row-split T becomes col-split</td></tr>
+      <tr><td><code>CPY</code></td><td>track total-elements-up-to-axis; locate the matching dim in dst</td><td>preserves the split through a copy</td></tr>
+      <tr><td><code>GET_ROWS</code></td><td>src[0] split + mirrored indices → keep src[0]'s split</td><td>embedding lookup where weights are row-split</td></tr>
+      <tr><td><code>FLASH_ATTN_EXT</code></td><td>asserts head-split on Q/K/V; emits AXIS_1 on output</td><td>attention is head-parallel; output is sequence-parallel</td></tr>
+      <tr><td><code>ROPE</code></td><td>passthrough; positions must be mirrored</td><td>row-split Q stays row-split after RoPE</td></tr>
+      <tr><td><code>SSM_CONV</code>, <code>SSM_SCAN</code></td><td>swap axis 0 ↔ 1 when both inputs agree</td><td>state-space layers</td></tr>
+    </tbody>
+  </table>
+
+  <p>The most interesting handler is <code>mul_mat</code>, because it is the one that decides whether an AllReduce is necessary. Pick your inputs' splits on the next widget; the output split is computed by the same code path as the real implementation.</p>
+
+  <div class="full">
+    <div class="diagram-frame">
+      <div style="font-family:var(--mono); font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:var(--ink-soft); margin-bottom:.7rem;">
+        mul_mat split propagator
+      </div>
+
+      <div class="propagator" id="prop-mm">
+        <div class="prop-cell" id="prop-a">
+          <div class="heading">A — weight (src[0])</div>
+          <div class="visual" id="prop-a-vis"></div>
+          <div class="axis-tag" id="prop-a-tag">AXIS_0</div>
+        </div>
+        <div class="prop-cell" id="prop-b">
+          <div class="heading">B — activation (src[1])</div>
+          <div class="visual" id="prop-b-vis"></div>
+          <div class="axis-tag" id="prop-b-tag">MIRRORED</div>
+        </div>
+        <div class="prop-cell" id="prop-out">
+          <div class="heading">A · B<sup>T</sup> — output</div>
+          <div class="visual" id="prop-out-vis"></div>
+          <div class="axis-tag" id="prop-out-tag">AXIS_0</div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <span class="lbl">A:</span>
+        <select id="prop-sel-a">
+          <option value="0">AXIS_0 (row-split)</option>
+          <option value="1" selected>AXIS_1 (col-split)</option>
+          <option value="mirror">MIRRORED</option>
+        </select>
+        <span class="lbl">B:</span>
+        <select id="prop-sel-b">
+          <option value="0">AXIS_0 (row-split)</option>
+          <option value="1">AXIS_1 (col-split)</option>
+          <option value="mirror" selected>MIRRORED</option>
+        </select>
+        <div class="status" id="prop-status"></div>
+      </div>
+    </div>
+  </div>
+
+  <p style="margin-top:0.4rem;">The handler is small — four cases plus a default abort. Two cases produce a clean split with no reduction needed (mirror × mirror; row-split × mirrored, the canonical tensor-parallel layer); one case (col × col where the inner reduction crosses devices) produces a PARTIAL, the only signal the rest of the system uses to know that an AllReduce is pending.</p>
+
+  <pre><span class="lbl">ggml-backend-meta.cpp — line 535</span><span class="kw">if</span> (src_ss[0].axis == MIRRORED &amp;&amp; src_ss[1].axis == MIRRORED) {
+    <span class="kw">return</span> {MIRRORED, {0}, <span class="num">1</span>};
+}
+<span class="kw">if</span> (src_ss[0].axis == AXIS_1 &amp;&amp; src_ss[1].axis == MIRRORED) {
+    <span class="kw">return</span> {AXIS_0, ...};   <span class="cmt">// tensor-parallel layer</span>
+}
+<span class="kw">if</span> (src_ss[1].axis == AXIS_1 &amp;&amp; src_ss[0].axis == MIRRORED) {
+    <span class="kw">return</span> src_ss[1];      <span class="cmt">// rare; matmul with split RHS</span>
+}
+<span class="kw">if</span> (src_ss[0].axis == AXIS_0 &amp;&amp; src_ss[1].axis == AXIS_0) {
+    <span class="kw">return</span> {assume_sync ? MIRRORED : <span class="kw">PARTIAL</span>, ...};
+}
+GGML_ABORT(<span class="str">"fatal error"</span>);</pre>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ M.4">Subgraphs, cut at the reductions</h2>
+
+  <p>Now the graph. Once every node has a split state, the driver walks the linearized cgraph and partitions it into <em>subgraphs</em> — runs of nodes that can execute on each device independently, separated by AllReduce points. The cut comes at exactly the points where a node's split state is PARTIAL: each device finished its share of the work, and the next op cannot proceed until the partials meet.</p>
+
+  <pre><span class="lbl">ggml-backend-meta.cpp — line 1822</span><span class="kw">for</span> (<span class="typ">int</span> i = <span class="num">0</span>; i &lt; cgraph-&gt;n_nodes; i++) {
+    <span class="kw">const</span> <span class="kw">auto</span> ss = <span class="fn">get_split_state</span>(cgraph-&gt;nodes[i], <span class="kw">false</span>);
+    <span class="kw">const</span> <span class="typ">bool</span> new_subgraph =
+        (i + <span class="num">1</span> == cgraph-&gt;n_nodes) <span class="op">||</span>
+        (ss.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL);
+    <span class="kw">if</span> (!new_subgraph) <span class="kw">continue</span>;
+    ...
+}</pre>
+
+  <p>Each subgraph is then materialised <em>N</em> times — one copy per simple backend, with the high-level nodes replaced by their per-device simple tensors. The driver calls <code>ggml_backend_graph_compute_async</code> on each device's subgraph in turn, then runs an AllReduce on the boundary, then proceeds to the next subgraph.</p>
+
+  <div class="full">
+    <div class="diagram-frame">
+      <svg viewBox="0 0 880 220" xmlns="http://www.w3.org/2000/svg">
+        <text class="dg-title" x="20" y="22">cgraph → subgraphs, cut at PARTIAL boundaries</text>
+
+        <!-- node strip -->
+        <g transform="translate(20, 50)">
+          <!-- subgraph 1 (3 nodes) -->
+          <g>
+            <rect x="0" y="0" width="60" height="40" class="dg-fill"/>
+            <rect x="62" y="0" width="60" height="40" class="dg-fill"/>
+            <rect x="124" y="0" width="60" height="40" class="dg-fill"/>
+            <text x="30" y="24" class="dg-text" text-anchor="middle">add</text>
+            <text x="92" y="24" class="dg-text" text-anchor="middle">norm</text>
+            <text x="154" y="24" class="dg-text" text-anchor="middle">view</text>
+          </g>
+          <!-- partial node -->
+          <rect x="190" y="0" width="60" height="40" fill="#e5b6a0" stroke="#1a1715" stroke-width="1.2"/>
+          <text x="220" y="24" class="dg-text" text-anchor="middle" style="font-weight:600;fill:#7a3a1c;">mul_mat</text>
+          <text x="220" y="60" class="dg-label" text-anchor="middle" fill="#b73a26">PARTIAL ← cut</text>
+
+          <!-- subgraph 2 -->
+          <g transform="translate(290, 0)">
+            <rect x="0" y="0" width="60" height="40" class="dg-fill"/>
+            <rect x="62" y="0" width="60" height="40" class="dg-fill"/>
+            <rect x="124" y="0" width="60" height="40" class="dg-fill"/>
+            <text x="30" y="24" class="dg-text" text-anchor="middle">add</text>
+            <text x="92" y="24" class="dg-text" text-anchor="middle">silu</text>
+            <text x="154" y="24" class="dg-text" text-anchor="middle">mul</text>
+          </g>
+
+          <!-- partial -->
+          <rect x="480" y="0" width="60" height="40" fill="#e5b6a0" stroke="#1a1715" stroke-width="1.2"/>
+          <text x="510" y="24" class="dg-text" text-anchor="middle" style="font-weight:600;fill:#7a3a1c;">mul_mat</text>
+          <text x="510" y="60" class="dg-label" text-anchor="middle" fill="#b73a26">PARTIAL ← cut</text>
+
+          <!-- subgraph 3 -->
+          <g transform="translate(580, 0)">
+            <rect x="0" y="0" width="60" height="40" class="dg-fill"/>
+            <rect x="62" y="0" width="60" height="40" class="dg-fill"/>
+            <text x="30" y="24" class="dg-text" text-anchor="middle">norm</text>
+            <text x="92" y="24" class="dg-text" text-anchor="middle">add</text>
+          </g>
+        </g>
+
+        <!-- subgraph bracket labels -->
+        <g transform="translate(20, 130)">
+          <line x1="0" y1="0" x2="250" y2="0" class="dg-stroke"/>
+          <line x1="0" y1="-4" x2="0" y2="6" class="dg-stroke"/>
+          <line x1="250" y1="-4" x2="250" y2="6" class="dg-stroke"/>
+          <text class="dg-label" x="80" y="20">subgraph 0</text>
+
+          <line x1="290" y1="0" x2="540" y2="0" class="dg-stroke"/>
+          <line x1="290" y1="-4" x2="290" y2="6" class="dg-stroke"/>
+          <line x1="540" y1="-4" x2="540" y2="6" class="dg-stroke"/>
+          <text class="dg-label" x="370" y="20">subgraph 1</text>
+
+          <line x1="580" y1="0" x2="745" y2="0" class="dg-stroke"/>
+          <line x1="580" y1="-4" x2="580" y2="6" class="dg-stroke"/>
+          <line x1="745" y1="-4" x2="745" y2="6" class="dg-stroke"/>
+          <text class="dg-label" x="630" y="20">subgraph 2</text>
+        </g>
+
+        <!-- bottom row: compute steps -->
+        <g transform="translate(20, 170)">
+          <text class="dg-label" x="0" y="0">on each device:</text>
+          <text class="dg-text" x="0" y="20">graph_compute(sg₀) → AllReduce → graph_compute(sg₁) → AllReduce → graph_compute(sg₂)</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>
+      <span class="fig-num">Fig. M.1</span>
+      <span class="fig-desc">Subgraphs are bounded by PARTIAL nodes; each device runs its slice, then a collective reduction restores a consumable state before the next subgraph.</span>
+    </figcaption>
+  </figure>
+
+  <p>The subgraph plan is cached on the input cgraph's UID. If the same graph comes through twice — which is the common case in a streaming decode — the second pass skips the partition step entirely and just dispatches the prebuilt per-device subgraphs.</p>
+
+  <aside class="margin">
+    <span class="ref">§ M.4 — assume_sync</span>
+    The mul_mat handler takes an <code>assume_sync</code> bool. When the caller (set_tensor, get_tensor) just wants to know "where is this tensor's data <em>logically</em>", an AXIS_0 × AXIS_0 mul_mat is reported as <code>MIRRORED</code> — because by the time the data is read, the reduction will have happened. The compute path uses <code>assume_sync=false</code> and gets back <code>PARTIAL</code> so it knows to insert the reduction.
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ M.5">The AllReduce, two ways</h2>
+
+  <p>When the partition is done, what remains is to take a set of PARTIAL tensors — one on each device — and reduce them so every device ends up with the sum. The meta backend tries first to ask the underlying backend whether it has a native collective; CUDA, for example, exports <code>ggml_backend_comm_allreduce_tensor</code> backed by NCCL. If that returns true, the reduction is delegated and the driver moves on. If not, the fallback builds the reduction out of ordinary ggml nodes.</p>
+
+  <p>The fallback is a butterfly: at each step <em>k</em>, device <em>j</em> exchanges its tensor with device <em>j</em> XOR 2<sup>k</sup>. The exchanged tensor is copied through an auxiliary buffer (one per step, sized to the largest PARTIAL in the graph), then summed into the local tensor via an <code>OP_ADD</code> node. After log₂<em>N</em> steps every device holds the full sum.</p>
+
+  <div class="full">
+    <div class="diagram-frame">
+      <div style="font-family:var(--mono); font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:var(--ink-soft); margin-bottom:.7rem;">
+        Butterfly AllReduce — 4 devices, 2 steps · click to advance
+      </div>
+      <div class="butterfly" id="bf">
+        <div class="bf-rowlbl"></div>
+        <div class="bf-headcol">step 0 · start</div>
+        <div class="bf-headcol">step 1 · ⊕ XOR 1</div>
+        <div class="bf-headcol">step 2 · ⊕ XOR 2</div>
+        <!-- rows are populated by JS -->
+      </div>
+      <div class="controls">
+        <button id="bf-step" class="primary">step ▶</button>
+        <button id="bf-reset">reset</button>
+        <div class="status" id="bf-status">click step to begin</div>
+      </div>
+    </div>
+  </div>
+
+  <p>Two details from the implementation are worth surfacing. First, the auxiliary buffer rotates per step (<code>i_buf</code> in the code), so a slow device does not stall the next step's data motion: while it is still summing, the next step's incoming tensor lands in a different buffer. Second, when <em>N</em> is not a power of two, the excess devices first push their partial into one of the lower indices, then participate by sitting out the butterfly and receiving the final sum at the end — keeping the inner loop a clean log₂ of the round number.</p>
+
+  <aside class="margin">
+    <span class="ref">§ M.5 — when there is no comm</span>
+    On a single GPU the meta backend is overhead with no benefit; the comm_init is skipped and the AllReduce path is never taken. The split states still get computed, but every tensor ends up MIRRORED and there is one subgraph for the whole compute.
+  </aside>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ M.6">Delaying the reduce, for MoE</h2>
+
+  <p>Mixture-of-experts layers produce a PARTIAL tensor that is immediately followed by a small constellation of MIRRORED operations: a scale by gate weights, possibly an add of two expert outputs, sometimes a final mul by a router score. Each of those ops can be done locally on the partial sum, because their MIRRORED other operand is the same on every device. The reduction can wait until after the constellation, when there is exactly one tensor to AllReduce instead of two or three.</p>
+
+  <p>The driver looks for this pattern with a helper named <code>get_i_delayed</code>. Given a node index <em>i</em> that <em>would</em> have ended the subgraph, it scans forward across MIRRORED ops whose operands all share a split with the candidate — first an optional <code>ADD_ID</code> for the MoE bias, then a chain of <code>MUL</code>s, then a final <code>ADD</code> that combines per-expert contributions. When the pattern fits, <em>i</em> is advanced to the end of the chain; the subgraph swallows the constellation and the reduction happens once, at the chain's tail.</p>
+
+  <pre><span class="lbl">ggml-backend-meta.cpp — line 1716 (paraphrased)</span><span class="cmt">// Walk past mirrored ops whose only PARTIAL ancestor is `node`,</span>
+<span class="cmt">// so that the upcoming AllReduce can be done once at the chain tail.</span>
+<span class="kw">int</span> <span class="fn">get_i_delayed</span>(<span class="kw">int</span> i) {
+    <span class="cmt">// 1) optional ADD_ID with mirrored bias</span>
+    <span class="cmt">// 2) chain of MULs with mirrored rhs</span>
+    <span class="cmt">// 3) tree-reduction ADD of per-expert outputs (sum of n_used)</span>
+    <span class="kw">return</span> i_delayed;
+}</pre>
+
+  <p>There is a wrinkle. If a particular device's slice is zero-sized — for example, a gating tensor that has all-zero rows on this rank — the participating node must have its <code>GGML_TENSOR_FLAG_COMPUTE</code> cleared so that the simple backend does not attempt to operate on an empty tensor. The delay logic propagates that clear flag forward through the chain, so the eventual AllReduce sees zeros from that device rather than uninitialised memory.</p>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ M.7">What this buys, and what it costs</h2>
+
+  <p>The shape of the abstraction is doing several things at once. First, it makes multi-device a backend concern, not a scheduler concern: the rest of ggml — the operator library, the cgraph machinery, the public C API — is none the wiser. Second, it makes the sharding declarative: the caller assigns split states to parameters once, and the inference rules carry that decision through every op without further configuration. Third, it makes the collective costs visible in the graph itself: an AllReduce is a subgraph boundary, and the boundaries are countable from the partitioner's output. You can read the cost of a multi-GPU forward pass off the cgraph the same way you read the cost of a single-GPU one.</p>
+
+  <p>The price is paid in coverage. Every new op needs a split-state inference rule (see the table in §M.3); ops that lack one will hit a <code>GGML_ABORT</code> the first time they appear in a meta-backend graph. The reduction is communication-bound, and the butterfly fallback assumes peer-to-peer copy between simple backends works — true on multi-GPU CUDA, less so when the simple backends are heterogeneous. The MoE delay is a peephole that works only for the specific MUL/ADD/ADD_ID shape; other constellations would each need their own heuristic.</p>
+
+  <div class="callout">
+    <span class="label">Comparison</span>
+    <p>The meta backend is one of three multi-device strategies in ggml. The older <em>layer-split</em> mode partitions whole layers across devices and is pipeline-parallel (each device runs different layers serially); the older <em>row-split</em> mode operates inside a single mul_mat. The meta backend generalises both: row-split becomes one possible <em>per-tensor</em> decision, and pipeline overlap falls out of the fact that subgraphs on different devices can run asynchronously between AllReduce barriers.</p>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 data-section="§ M.8">A summary</h2>
+
+  <p>The meta backend is a single device that owns several. It hides the sharding behind the ordinary backend interface, classifies every tensor by how it is distributed (five split states), derives output splits from input splits one op at a time, partitions the cgraph at the points where a reduction is needed, and runs an AllReduce — backend-native if it can, butterfly-by-graph-nodes otherwise — to bridge across the cuts. There is a peephole that delays the reduce past mirrored ops to make MoE tractable, and a cache keyed on cgraph UID to amortise the partitioning across repeated forwards.</p>
+
+  <p>Compared to the <a href="recurrent-cache.html">recurrent cache</a> or the <a href="kv-cache-explainer/index.html">KV cache</a>, this is a much more horizontal kind of complexity: the file is long not because the ideas are deep but because each ggml op needs its own inference rule, and there are a lot of ops. The interesting kernel is small. The interesting question — &ldquo;how should this tensor be sharded?&rdquo; — is answered op by op, in twenty-line handlers, and the rest of the machinery follows from those answers like consequences from a definition.</p>
+
+</article>
+
+<script>
+// =============================================================
+// MUL_MAT SPLIT-STATE PROPAGATOR
+// =============================================================
+(function () {
+  const selA = document.getElementById('prop-sel-a');
+  const selB = document.getElementById('prop-sel-b');
+  const visA = document.getElementById('prop-a-vis');
+  const visB = document.getElementById('prop-b-vis');
+  const visOut = document.getElementById('prop-out-vis');
+  const tagA = document.getElementById('prop-a-tag');
+  const tagB = document.getElementById('prop-b-tag');
+  const tagOut = document.getElementById('prop-out-tag');
+  const outCell = document.getElementById('prop-out');
+  const status = document.getElementById('prop-status');
+
+  const N = 4;  // devices
+
+  function tagName(s) {
+    if (s === 'mirror') return 'MIRRORED';
+    if (s === 'partial') return 'PARTIAL';
+    return 'AXIS_' + s;
+  }
+
+  function renderViz(el, split) {
+    el.innerHTML = '';
+    el.style.flexDirection = (split === '1') ? 'column' : 'row';
+    for (let j = 0; j < N; j++) {
+      const seg = document.createElement('div');
+      seg.className = 'seg';
+      if (split === 'mirror') seg.classList.add('mirror');
+      else if (split === 'partial') seg.classList.add('partial');
+      else seg.classList.add('d' + j);
+      seg.textContent = 'd' + j;
+      seg.style.fontSize = '9px';
+      el.appendChild(seg);
+    }
+  }
+
+  function computeOut(a, b) {
+    if (a === 'mirror' && b === 'mirror') return { axis: 'mirror', note: 'mirror × mirror → mirror. Trivial: both devices hold the whole product.' };
+    if (a === '1' && b === 'mirror')      return { axis: '0',      note: 'row-split A × mirrored B → row-split output. Canonical tensor-parallel layer.' };
+    if (a === 'mirror' && b === '1')      return { axis: '1',      note: 'mirrored A × row-split B → row-split output. Rare (matmul with split RHS).' };
+    if (a === '0' && b === '0')           return { axis: 'partial',note: 'col-split A × col-split B → PARTIAL. Inner reduction crosses devices — AllReduce needed.' };
+    return { axis: null, note: 'Combination not handled by mul_mat — would abort. (A meta-backend graph won\'t produce this.)' };
+  }
+
+  function update() {
+    const a = selA.value, b = selB.value;
+    renderViz(visA, a);
+    renderViz(visB, b);
+    tagA.textContent = tagName(a);
+    tagB.textContent = tagName(b);
+
+    const out = computeOut(a, b);
+    if (out.axis === null) {
+      visOut.innerHTML = '<div style="margin:auto;font-family:var(--mono);font-size:11px;color:#b73a26;">— GGML_ABORT —</div>';
+      tagOut.textContent = 'UNKNOWN';
+      outCell.classList.remove('partial');
+      tagOut.style.background = '#b73a26';
+    } else {
+      renderViz(visOut, out.axis);
+      tagOut.textContent = tagName(out.axis);
+      outCell.classList.toggle('partial', out.axis === 'partial');
+      tagOut.style.background = '';
+    }
+    status.innerHTML = out.note;
+  }
+
+  selA.addEventListener('change', update);
+  selB.addEventListener('change', update);
+  update();
+})();
+
+// =============================================================
+// BUTTERFLY ALLREDUCE
+// =============================================================
+(function () {
+  const N = 4;
+  const grid = document.getElementById('bf');
+  const stepBtn = document.getElementById('bf-step');
+  const resetBtn = document.getElementById('bf-reset');
+  const status = document.getElementById('bf-status');
+
+  // Each device starts with a partial sum, conceptually "a_j".
+  // After step k, device j XORs with j ^ (1<<k) and adds.
+  let stepIdx;
+  let values;  // values[j] is array of strings of summed indices
+
+  function reset() {
+    stepIdx = 0;
+    values = [];
+    for (let j = 0; j < N; j++) values.push([j]);
+    render();
+    status.innerHTML = 'click <em>step</em> to begin';
+    stepBtn.disabled = false;
+  }
+
+  function setToString(s) {
+    return 'a' + s.join(' + a');
+  }
+
+  function render(highlights = []) {
+    // Clear all but header cells; rebuild rows
+    // Find rows (devices); each row has rowlbl + 3 step cells
+    const headerCells = 4;  // rowlbl + 3 step headers
+    while (grid.children.length > headerCells) grid.removeChild(grid.lastChild);
+
+    for (let j = 0; j < N; j++) {
+      const lbl = document.createElement('div');
+      lbl.className = 'bf-rowlbl';
+      lbl.textContent = 'device ' + j;
+      grid.appendChild(lbl);
+      for (let k = 0; k < 3; k++) {
+        const c = document.createElement('div');
+        c.className = 'bf-cell';
+        if (highlights.some(h => h[0] === j && h[1] === k)) c.classList.add('recv');
+        const cellVals = (k === 0) ? [j] : (k <= stepIdx ? cumulative(j, k) : null);
+        if (cellVals) {
+          c.innerHTML = `<span class="pid">d${j} · step ${k}</span><span class="val">${setToString(cellVals)}</span>`;
+        } else {
+          c.innerHTML = `<span class="pid">d${j} · step ${k}</span><span class="val" style="color:var(--mute);">·</span>`;
+        }
+        grid.appendChild(c);
+      }
+    }
+  }
+
+  // After k steps of butterfly: device j has summed a_i for all i with (j ^ i) < (1<<k)
+  // i.e. the bottom k bits of (i ^ j) are zero — wait, actually all i sharing prefix bits.
+  // Simpler: build it iteratively in the step function. Cache cumulative values.
+  const cache = [];  // cache[k][j] = array
+  function cumulative(j, k) {
+    if (cache[k] && cache[k][j]) return cache[k][j];
+    if (k === 0) return [j];
+    const prev = cumulative(j, k - 1);
+    const partner = j ^ (1 << (k - 1));
+    const prevPartner = cumulative(partner, k - 1);
+    const merged = Array.from(new Set([...prev, ...prevPartner])).sort((a, b) => a - b);
+    if (!cache[k]) cache[k] = [];
+    cache[k][j] = merged;
+    return merged;
+  }
+
+  function step() {
+    if (stepIdx >= 2) {
+      status.innerHTML = 'done — every device holds a₀ + a₁ + a₂ + a₃';
+      stepBtn.disabled = true;
+      return;
+    }
+    stepIdx += 1;
+    const offset = 1 << (stepIdx - 1);
+    const highlights = [];
+    for (let j = 0; j < N; j++) highlights.push([j, stepIdx]);
+    render(highlights);
+    status.innerHTML = `step ${stepIdx}: each device d exchanges with d XOR ${offset}, then adds.`;
+    if (stepIdx === 2) {
+      stepBtn.textContent = 'done';
+    }
+  }
+
+  stepBtn.addEventListener('click', step);
+  resetBtn.addEventListener('click', () => {
+    stepBtn.textContent = 'step ▶';
+    reset();
+  });
+  reset();
+})();
+</script>
+
+</body>
+</html>
