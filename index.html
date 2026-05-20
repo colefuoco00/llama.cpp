@@ -1,0 +1,758 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The Importance Matrix — a note on activation-weighted quantization</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT,WONK@9..144,300..900,0..100,0..1&family=Newsreader:opsz,ital,wght@6..72,0,200..800;6..72,1,200..800&family=JetBrains+Mono:wght@300..700&display=swap">
+<style>
+:root {
+  --paper:        #f1ead9;
+  --paper-2:      #ebe1c8;
+  --ink:          #1a1411;
+  --ink-soft:     #4d4036;
+  --rule:         #b9a98a;
+  --rule-soft:    #d4c6a8;
+  --oxblood:      #8a2418;
+  --oxblood-deep: #5d180f;
+  --marginalia:   #756753;
+
+  --serif:   "Newsreader", "Iowan Old Style", Palatino, Georgia, serif;
+  --display: "Fraunces", "Newsreader", Georgia, serif;
+  --mono:    "JetBrains Mono", "SF Mono", Consolas, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 17px; }
+@media (min-width: 1100px) { html { font-size: 18px; } }
+
+body {
+  background:
+    radial-gradient(ellipse at 18% 4%, rgba(138, 36, 24, 0.05), transparent 55%),
+    radial-gradient(ellipse at 92% 70%, rgba(70, 50, 30, 0.06), transparent 65%),
+    linear-gradient(180deg, var(--paper), var(--paper-2));
+  background-attachment: fixed;
+  color: var(--ink);
+  font-family: var(--serif);
+  font-feature-settings: "kern", "liga", "onum";
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+/* paper grain */
+body::before {
+  content: "";
+  position: fixed; inset: 0;
+  pointer-events: none;
+  z-index: 100;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.15 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  mix-blend-mode: multiply;
+  opacity: 0.45;
+}
+
+::selection { background: rgba(138, 36, 24, 0.22); color: var(--ink); }
+
+/* — masthead — */
+.masthead {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem 2.5rem 0.85rem;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: baseline;
+  gap: 1.5rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+.masthead .left   { text-align: left; }
+.masthead .center { color: var(--oxblood); font-weight: 500; }
+.masthead .right  { text-align: right; }
+
+/* — header — */
+.header {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 4.5rem 2.5rem 2rem;
+  position: relative;
+}
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--oxblood);
+  margin-bottom: 2rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.eyebrow::before {
+  content: "";
+  display: inline-block;
+  width: 1.5rem;
+  height: 1px;
+  background: var(--oxblood);
+}
+
+.title {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 144, "wght" 380, "SOFT" 30;
+  font-size: clamp(3.4rem, 9vw, 7.5rem);
+  line-height: 0.92;
+  letter-spacing: -0.025em;
+  margin-bottom: 1.75rem;
+  max-width: 14ch;
+}
+.title .ital {
+  font-style: italic;
+  font-variation-settings: "opsz" 144, "wght" 360, "SOFT" 60, "WONK" 1;
+  color: var(--oxblood);
+}
+
+.dek {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: clamp(1.1rem, 1.6vw, 1.35rem);
+  line-height: 1.5;
+  color: var(--ink-soft);
+  max-width: 52ch;
+  font-variation-settings: "opsz" 18, "wght" 380;
+}
+
+.byline {
+  margin-top: 2.5rem;
+  display: flex;
+  gap: 2.5rem;
+  flex-wrap: wrap;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--marginalia);
+}
+.byline span { display: block; }
+.byline strong {
+  color: var(--ink);
+  font-weight: 400;
+  display: block;
+  margin-top: 0.35rem;
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1rem;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variation-settings: "opsz" 14, "wght" 420;
+}
+
+/* — hero figure — */
+.figure {
+  max-width: 1200px;
+  margin: 3rem auto 4rem;
+  padding: 0 2.5rem;
+}
+
+.matrix-wrap {
+  background: linear-gradient(180deg, #f7f1e0 0%, #ede2c2 100%);
+  border: 1px solid var(--rule);
+  padding: 2.5rem;
+  position: relative;
+  box-shadow: 0 1px 0 rgba(0,0,0,0.04), 0 30px 60px -40px rgba(60, 30, 10, 0.25);
+}
+.matrix-wrap::before {
+  content: "";
+  position: absolute;
+  inset: 6px;
+  border: 1px solid var(--rule-soft);
+  pointer-events: none;
+}
+
+.matrix-label {
+  position: absolute;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  z-index: 2;
+}
+.matrix-label.tl { top: 1.1rem; left: 1.5rem; }
+.matrix-label.tr { top: 1.1rem; right: 1.5rem; color: var(--oxblood); font-family: var(--serif); font-style: italic; text-transform: none; letter-spacing: 0; font-size: 0.95rem; }
+.matrix-label.bl { bottom: 1.1rem; left: 1.5rem; }
+.matrix-label.br { bottom: 1.1rem; right: 1.5rem; color: var(--marginalia); }
+
+.matrix-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 1rem 0;
+}
+
+.matrix-cell {
+  opacity: 0;
+  animation: cell-in 0.6s cubic-bezier(.2,.7,.3,1) forwards;
+  transition: filter .15s;
+}
+.matrix-cell:hover { filter: brightness(0.7) saturate(1.3); }
+@keyframes cell-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.figcap {
+  margin-top: 1.5rem;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1.5rem;
+  font-size: 0.94rem;
+  line-height: 1.55;
+  color: var(--ink-soft);
+  max-width: 60rem;
+}
+.figcap .num {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--oxblood);
+  white-space: nowrap;
+  padding-top: 0.2rem;
+}
+.figcap p { font-style: italic; font-variation-settings: "opsz" 16, "wght" 380; }
+
+/* — article — */
+.article {
+  max-width: 1200px;
+  margin: 4rem auto 6rem;
+  padding: 0 2.5rem;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 2rem;
+}
+@media (min-width: 880px) {
+  .article {
+    grid-template-columns: 13rem 1fr;
+    gap: 3.5rem;
+  }
+}
+
+.aside .toc {
+  position: sticky;
+  top: 2rem;
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  letter-spacing: 0.08em;
+  line-height: 1.6;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--rule);
+}
+.aside .toc h4 {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  margin-bottom: 1.1rem;
+  font-weight: 500;
+}
+.aside .toc a {
+  display: grid;
+  grid-template-columns: 1.6rem 1fr;
+  align-items: baseline;
+  color: var(--marginalia);
+  text-decoration: none;
+  padding: 0.35rem 0;
+  border-bottom: 1px dotted transparent;
+  transition: color .2s, border-color .2s, transform .2s;
+}
+.aside .toc a:hover,
+.aside .toc a.active {
+  color: var(--oxblood);
+  transform: translateX(2px);
+}
+.aside .toc a.active { border-bottom-color: var(--rule); }
+.aside .toc .roman {
+  color: var(--oxblood);
+  font-family: var(--display);
+  font-style: italic;
+  font-variation-settings: "opsz" 14, "wght" 500;
+  font-size: 0.95rem;
+  letter-spacing: 0;
+  text-transform: lowercase;
+}
+
+.body { max-width: 38rem; }
+
+.body section { margin-bottom: 3.5rem; position: relative; }
+
+.body h2 {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 36, "wght" 450;
+  font-size: 1.9rem;
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+  margin-bottom: 1.25rem;
+  display: flex;
+  align-items: baseline;
+  gap: 0.9rem;
+  scroll-margin-top: 2rem;
+}
+.body h2 .num {
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  letter-spacing: 0.18em;
+  color: var(--oxblood);
+  font-variation-settings: normal;
+}
+
+.body p {
+  font-family: var(--serif);
+  font-variation-settings: "opsz" 18, "wght" 380;
+  font-size: 1.0625rem;
+  line-height: 1.62;
+  margin-bottom: 1.1rem;
+  color: var(--ink);
+  text-wrap: pretty;
+  hanging-punctuation: first;
+}
+
+.body p.lede::first-letter {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 144, "wght" 500, "SOFT" 30;
+  font-size: 5.2rem;
+  line-height: 0.82;
+  float: left;
+  padding: 0.45rem 0.55rem 0 0;
+  color: var(--oxblood);
+}
+
+.body em { font-style: italic; font-variation-settings: "opsz" 18, "wght" 380; }
+.body strong { font-variation-settings: "opsz" 18, "wght" 580; color: var(--ink); }
+
+/* display equation */
+.eq {
+  display: block;
+  margin: 1.5rem 0;
+  padding: 1.25rem 5rem 1.25rem 1.5rem;
+  background: rgba(138, 36, 24, 0.04);
+  border-left: 2px solid var(--oxblood);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1.15rem;
+  font-variation-settings: "opsz" 24, "wght" 380;
+  line-height: 1.5;
+  position: relative;
+}
+.eq .lbl {
+  position: absolute;
+  right: 1rem;
+  bottom: 0.85rem;
+  font-family: var(--mono);
+  font-style: normal;
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  color: var(--marginalia);
+  text-transform: uppercase;
+}
+.eq sub, .eq sup { font-size: 0.68em; line-height: 0; }
+
+/* code */
+pre {
+  background: #18120f;
+  color: #ebe1c8;
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  line-height: 1.7;
+  overflow-x: auto;
+  border-left: 2px solid var(--oxblood);
+  font-weight: 400;
+}
+pre .c { color: #857c6a; font-style: italic; }
+pre .k { color: #d68a5c; }
+pre .s { color: #c5a872; }
+pre .n { color: #d1a98a; }
+pre .f { color: #ebe1c8; font-weight: 500; }
+
+code.inl {
+  font-family: var(--mono);
+  font-size: 0.86em;
+  background: rgba(138, 36, 24, 0.08);
+  padding: 0.08em 0.42em;
+  border-radius: 2px;
+  color: var(--oxblood-deep);
+  white-space: nowrap;
+}
+
+/* marginalia */
+.note {
+  display: block;
+  margin: 1rem 0;
+  padding-left: 1rem;
+  border-left: 1px solid var(--rule);
+  font-family: var(--serif);
+  font-style: italic;
+  font-variation-settings: "opsz" 12, "wght" 380;
+  font-size: 0.86rem;
+  line-height: 1.5;
+  color: var(--marginalia);
+}
+.note .marker {
+  font-family: var(--display);
+  font-style: italic;
+  color: var(--oxblood);
+  font-size: 0.95rem;
+  margin-right: 0.4rem;
+  font-variation-settings: "opsz" 12, "wght" 500;
+}
+@media (min-width: 1240px) {
+  .note {
+    position: absolute;
+    left: calc(100% + 2.5rem);
+    width: 13.5rem;
+    margin: 0;
+    border-left: none;
+    padding-left: 0;
+    padding-top: 0.45rem;
+    border-top: 1px solid var(--rule);
+  }
+}
+
+/* tiny bar chart */
+.chart {
+  margin: 1.5rem 0 1.75rem;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+.chart .row {
+  display: grid;
+  grid-template-columns: 5.5rem 1fr 4rem;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px dotted var(--rule);
+}
+.chart .row:last-child { border-bottom: 0; }
+.chart .name { color: var(--ink-soft); letter-spacing: 0.06em; }
+.chart .bar {
+  height: 9px;
+  background: rgba(0,0,0,0.04);
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--rule-soft);
+}
+.chart .bar::after {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  background: linear-gradient(90deg, var(--oxblood), var(--oxblood-deep));
+  width: 0;
+  animation: bar-in 1.4s cubic-bezier(.2,.7,.2,1) forwards;
+  animation-delay: var(--d, 0s);
+}
+@keyframes bar-in { to { width: var(--w, 50%); } }
+.chart .val { color: var(--oxblood); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ornament */
+.ornament-rule {
+  margin: 3.5rem 0;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 1rem;
+}
+.ornament-rule::before, .ornament-rule::after {
+  content: "";
+  height: 1px;
+  background: var(--rule);
+}
+.ornament-rule span {
+  font-family: var(--display);
+  font-style: italic;
+  font-variation-settings: "opsz" 24, "wght" 500;
+  font-size: 1.1rem;
+  color: var(--oxblood);
+}
+
+/* footer */
+.colophon {
+  max-width: 1200px;
+  margin: 6rem auto 4rem;
+  padding: 2rem 2.5rem;
+  border-top: 1px solid var(--rule);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2rem;
+  align-items: end;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--marginalia);
+}
+.colophon .credit {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 0.94rem;
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.55;
+  color: var(--ink-soft);
+  max-width: 36rem;
+  font-variation-settings: "opsz" 14, "wght" 380;
+}
+
+/* small */
+@media (max-width: 720px) {
+  .masthead { grid-template-columns: 1fr; text-align: left; gap: 0.2rem; padding: 1.25rem 1.5rem 0.5rem; }
+  .masthead .center, .masthead .right { text-align: left; }
+  .header  { padding: 2.5rem 1.5rem 1.5rem; }
+  .figure  { padding: 0 1.5rem; }
+  .matrix-wrap { padding: 2rem 1.25rem 1.25rem; }
+  .matrix-label { font-size: 0.62rem; }
+  .article { padding: 0 1.5rem; }
+  .colophon { padding: 2rem 1.5rem; grid-template-columns: 1fr; }
+  .eq { padding-right: 1.5rem; }
+  .eq .lbl { position: static; display: block; margin-top: 0.5rem; }
+}
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="left">Vol. iv &middot; No. 7</div>
+  <div class="center">— a study in low-bit allocation —</div>
+  <div class="right">folio 01 &middot; 2026</div>
+</header>
+
+<section class="header">
+  <div class="eyebrow">A note on activation-weighted quantization</div>
+  <h1 class="title">The <span class="ital">Importance</span> Matrix</h1>
+  <p class="dek">A small file, derived from a few hundred thousand tokens, that tells a quantizer where to spend its bits — and where it can afford not to.</p>
+
+  <div class="byline">
+    <span>Subject<strong>llama.cpp &middot; imatrix</strong></span>
+    <span>Family<strong>GGUF, k-quants, IQ-quants</strong></span>
+    <span>Read<strong>Twelve minutes</strong></span>
+  </div>
+</section>
+
+<figure class="figure">
+  <div class="matrix-wrap">
+    <span class="matrix-label tl">Fig. 1</span>
+    <span class="matrix-label tr">E[ xᵢ² ]</span>
+    <span class="matrix-label bl">channel &middot; 0 → 47</span>
+    <span class="matrix-label br">block 21 &middot; ffn_down</span>
+
+    <svg class="matrix-svg" viewBox="0 0 960 360" preserveAspectRatio="none" id="mx"></svg>
+  </div>
+  <figcaption class="figcap">
+    <span class="num">Fig. 1 →</span>
+    <p>A single row of the importance matrix, visualized for one feed-forward projection. Each cell is one input channel; saturation tracks the mean squared activation gathered over the calibration corpus. The bright clusters are the channels a 4-bit quantizer will be told to treat with care; the pale field is what it is permitted to round.</p>
+  </figcaption>
+</figure>
+
+<article class="article">
+
+<aside class="aside">
+  <nav class="toc">
+    <h4>Contents</h4>
+    <a href="#problem"><span class="roman">i.</span><span>The Allocation</span></a>
+    <a href="#definition"><span class="roman">ii.</span><span>A definition</span></a>
+    <a href="#compute"><span class="roman">iii.</span><span>How it is gathered</span></a>
+    <a href="#use"><span class="roman">iv.</span><span>Where it enters</span></a>
+    <a href="#empirical"><span class="roman">v.</span><span>What it buys</span></a>
+    <a href="#caveats"><span class="roman">vi.</span><span>Failure modes</span></a>
+  </nav>
+</aside>
+
+<div class="body">
+
+<section id="problem">
+<h2><span class="num">i.</span> The Allocation</h2>
+<p class="lede"><strong>Quantization is a budget problem.</strong> A seven-billion-parameter model has seven billion places where precision can be spent; a Q4_K_M file gives the encoder roughly four bits per parameter to spend. The encoder must decide, weight by weight, how to round. A uniform scheme treats every parameter as equally consequential — but a forward pass through a transformer does not. Some channels carry signal that dominates the next layer's pre-activation; others carry whispers. Squashing a loud channel onto the same coarse grid as a quiet one wastes resolution where it would have done the most good.</p>
+
+<p>The importance matrix — written <code class="inl">imatrix.dat</code> on disk — is the encoder's hint. For every linear projection in the network, it records a single number per input channel: how much that channel <em>actually moved</em> when the model was shown real text. The quantizer reads this hint and biases its grid toward the channels that mattered.</p>
+
+<aside class="note"><span class="marker">¶</span>In practice the file is small — a few megabytes — even for a 70B model. It is metadata, not weights.</aside>
+</section>
+
+<section id="definition">
+<h2><span class="num">ii.</span> A definition</h2>
+<p>For a linear layer <code class="inl">y = W x</code>, llama.cpp accumulates the second moment of the inputs over a calibration corpus of <em>N</em> tokens:</p>
+
+<div class="eq">
+  I<sub>i</sub> &nbsp;=&nbsp; (1 / N) &nbsp; Σ<sub>t = 1..N</sub> &nbsp; x<sub>i,t</sub><sup>2</sup>
+  <span class="lbl">eq. 1</span>
+</div>
+
+<p>Here <em>x<sub>i,t</sub></em> is the i-th input feature at token <em>t</em>, and the sum runs over every position in every calibration document. The resulting vector <em>I</em>, with one entry per input column of <em>W</em>, is the row of the imatrix that belongs to this tensor.</p>
+
+<p>Mathematically this is the same object that turns up in the diagonal of the Fisher information for a quadratic loss: the expected squared activation is a proxy for <em>how much does perturbing this column of W move the output</em>. Doubling the precision of a column with twice the expected activation halves twice as much error.</p>
+
+<aside class="note"><span class="marker">¶</span>Strictly, this is a heuristic — the true Fisher would also include downstream Jacobians. The squared-activation approximation works because the dominant contribution to per-weight loss is local, and because it can be gathered in a single forward pass with no backward graph.</aside>
+</section>
+
+<section id="compute">
+<h2><span class="num">iii.</span> How it is gathered</h2>
+
+<p>The <code class="inl">llama-imatrix</code> binary reads a corpus of plain text, runs the model in forward-only mode at full precision, and at each linear layer captures the input tensor just before the matmul. Squared values are accumulated into a per-tensor float buffer. The corpus is typically a few hundred thousand tokens — a slice of wikitext, a domain mix, a curated chat log:</p>
+
+<pre><span class="c"># gather statistics over a calibration corpus</span>
+<span class="f">llama-imatrix</span> \
+  <span class="k">-m</span> <span class="s">models/gemma-2-9b.f16.gguf</span> \
+  <span class="k">-f</span> <span class="s">calibration/wikitext.train.raw</span> \
+  <span class="k">-o</span> <span class="s">gemma-2-9b.imatrix</span> \
+  <span class="k">--chunks</span> <span class="n">200</span> <span class="k">-c</span> <span class="n">512</span>
+
+<span class="c"># then quantize, passing the hint in</span>
+<span class="f">llama-quantize</span> \
+  <span class="k">--imatrix</span> <span class="s">gemma-2-9b.imatrix</span> \
+  <span class="s">models/gemma-2-9b.f16.gguf</span> \
+  <span class="s">models/gemma-2-9b.IQ3_M.gguf</span> \
+  <span class="k">IQ3_M</span></pre>
+
+<p>The estimate stabilizes faster than one might expect. Most channels carry consistent statistics across natural text — a hundred thousand tokens is usually within a few percent of the limit, and going to ten million changes the resulting perplexity by less than the run-to-run noise.</p>
+
+<aside class="note"><span class="marker">¶</span>Stability is a property of the second moment, not of the model. A long-tailed distribution would need orders of magnitude more samples; activations in well-trained transformers are not long-tailed.</aside>
+</section>
+
+<section id="use">
+<h2><span class="num">iv.</span> Where it enters</h2>
+
+<p>During quantization, the blockwise quantizers — Q4_K, Q5_K, the IQ family — solve a weighted least-squares problem per block of <em>n</em> weights:</p>
+
+<div class="eq">
+  minimize &nbsp; Σ<sub>i</sub> &nbsp; I<sub>i</sub> &middot; ( W<sub>i</sub> &minus; Q(W<sub>i</sub>) )<sup>2</sup>
+  <span class="lbl">eq. 2</span>
+</div>
+
+<p>instead of the unweighted form. The scale, the offset, and (for the IQ-quants) the codebook selection are all chosen to minimise this importance-weighted error. Columns with large <em>I<sub>i</sub></em> pull the grid toward themselves; columns with small <em>I<sub>i</sub></em> are allowed to drift.</p>
+
+<p>The effect is largest for the most aggressive formats. At <strong>IQ2</strong> there are essentially four representable magnitudes per block and every bit of redirected precision is consequential. At <strong>Q4_K_M</strong> the budget is generous enough that the imatrix moves perplexity by a few percent. At <strong>Q8_0</strong> there is so much headroom that the file is — for most models — indistinguishable from one quantized without a hint.</p>
+</section>
+
+<section id="empirical">
+<h2><span class="num">v.</span> What it buys</h2>
+
+<p>The improvement, measured by perplexity on held-out text, scales inversely with the bit budget. Rough magnitudes, averaged across a handful of dense decoder models:</p>
+
+<div class="chart">
+  <div class="row"><span class="name">IQ2_XS</span><span class="bar" style="--w: 88%; --d: 0.1s"></span><span class="val">−12.4%</span></div>
+  <div class="row"><span class="name">IQ3_M</span> <span class="bar" style="--w: 56%; --d: 0.2s"></span><span class="val">−7.8%</span></div>
+  <div class="row"><span class="name">Q4_K_M</span><span class="bar" style="--w: 28%; --d: 0.3s"></span><span class="val">−3.9%</span></div>
+  <div class="row"><span class="name">Q5_K_M</span><span class="bar" style="--w: 12%; --d: 0.4s"></span><span class="val">−1.6%</span></div>
+  <div class="row"><span class="name">Q6_K</span>  <span class="bar" style="--w:  4%; --d: 0.5s"></span><span class="val">−0.5%</span></div>
+  <div class="row"><span class="name">Q8_0</span>  <span class="bar" style="--w:  1%; --d: 0.6s"></span><span class="val">±0.1%</span></div>
+</div>
+
+<p>The improvement is larger still for architectures whose activations are heterogeneous: <strong>mixtures of experts</strong>, where many channels are silent on most tokens; models with <strong>attention sinks</strong>; models with long-tailed embedding statistics. For these, an unweighted quantizer is spending precision on routes that the network rarely uses. The imatrix redirects it.</p>
+</section>
+
+<div class="ornament-rule"><span>❦</span></div>
+
+<section id="caveats">
+<h2><span class="num">vi.</span> Failure modes</h2>
+
+<p>The calibration corpus matters more than any other choice. An imatrix gathered on English Wikipedia will under-weight channels that activate on source code, on non-Latin script, on chat formatting tokens, on tool-call syntax. The resulting quant will be quietly worse on those distributions — and the perplexity number on wikitext will not tell you. Most <em>this quant is worse than the official one</em> reports trace back to a mismatch between calibration text and target usage.</p>
+
+<p>The remedy is unglamorous: gather calibration data that <em>resembles what the model will be asked to do</em>. A coding model deserves a code-heavy calibration mix. A multilingual model deserves multilingual text. The imatrix is a hint, and a hint shaped wrong points the encoder in the wrong direction.</p>
+
+<aside class="note"><span class="marker">¶</span>A practical compromise that holds up: roughly sixty percent natural language across several languages, twenty-five percent code, fifteen percent structured chat. Resist the urge to over-tune; the second moment is robust, not delicate.</aside>
+</section>
+
+</div>
+</article>
+
+<footer class="colophon">
+  <div class="credit">Set in <em>Fraunces</em> and <em>Newsreader</em>; monospace in <em>JetBrains Mono</em>. Written for readers of GGUF files, against the background hum of a single GPU.</div>
+  <div class="meta">end &middot; folio 01</div>
+</footer>
+
+<script>
+/* — hero matrix visualization — */
+(function () {
+  const svg = document.getElementById('mx');
+  const COLS = 48, ROWS = 12;
+  const W = 960, H = 360;
+  const cw = W / COLS, ch = H / ROWS;
+
+  const hotspots = [
+    { x:  6, y: 3, s: 2.6, a: 1.00 },
+    { x: 22, y: 7, s: 3.4, a: 0.85 },
+    { x: 35, y: 2, s: 2.0, a: 0.72 },
+    { x: 41, y: 9, s: 2.8, a: 0.62 },
+    { x: 14, y: 9, s: 2.4, a: 0.55 },
+    { x: 30, y: 4, s: 1.8, a: 0.45 },
+  ];
+
+  function importance(i, j) {
+    let v = 0.05;
+    for (const h of hotspots) {
+      const dx = i - h.x, dy = j - h.y;
+      v += h.a * Math.exp(-(dx * dx + dy * dy) / (2 * h.s * h.s));
+    }
+    const r = Math.sin(i * 12.9898 + j * 78.233) * 43758.5453;
+    v += (r - Math.floor(r)) * 0.06 - 0.03;
+    return Math.max(0, Math.min(1, v));
+  }
+
+  const cells = [];
+  let frags = '';
+  for (let j = 0; j < ROWS; j++) {
+    for (let i = 0; i < COLS; i++) {
+      const v = importance(i, j);
+      const alpha = 0.04 + Math.pow(v, 1.35) * 0.96;
+      const x = i * cw + 1.5;
+      const y = j * ch + 1.5;
+      const w = cw - 3;
+      const h = ch - 3;
+      const delay = 80 + (i + j) * 18 + Math.random() * 80;
+      frags += `<rect class="matrix-cell" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" fill="rgba(138,36,24,${alpha.toFixed(3)})" style="animation-delay:${delay.toFixed(0)}ms"><title>ch ${i.toString().padStart(2,'0')} · I = ${v.toFixed(3)}</title></rect>`;
+      cells.push({ i, j, v });
+    }
+  }
+
+  // mark the strongest channels with a dashed outline
+  const topK = cells.slice().sort((a, b) => b.v - a.v).slice(0, 8);
+  for (const c of topK) {
+    const x = c.i * cw + 1.5;
+    const y = c.j * ch + 1.5;
+    const w = cw - 3;
+    const h = ch - 3;
+    const delay = 1500 + Math.random() * 400;
+    frags += `<rect class="matrix-cell" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" fill="none" stroke="#1a1411" stroke-width="1" stroke-dasharray="2 2" style="animation-delay:${delay.toFixed(0)}ms"></rect>`;
+  }
+
+  svg.innerHTML = frags;
+})();
+
+/* — scroll-spy for the TOC — */
+(function () {
+  const links = document.querySelectorAll('.aside .toc a');
+  const sections = Array.from(links).map(a => document.querySelector(a.getAttribute('href')));
+  function update() {
+    let active = 0;
+    const fold = window.innerHeight * 0.35;
+    for (let i = 0; i < sections.length; i++) {
+      const r = sections[i].getBoundingClientRect();
+      if (r.top <= fold) active = i;
+    }
+    links.forEach((l, i) => l.classList.toggle('active', i === active));
+  }
+  document.addEventListener('scroll', update, { passive: true });
+  update();
+})();
+</script>
+
+</body>
+</html>
