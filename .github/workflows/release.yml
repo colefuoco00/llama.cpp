@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - master
+      - gemma4-mtp
     paths: [
       '.github/workflows/release.yml',
       '**/CMakeLists.txt',
@@ -38,7 +39,7 @@ env:
 jobs:
 
   check_release:
-    runs-on: [self-hosted, fast]
+    runs-on: ubuntu-latest
 
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
