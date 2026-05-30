@@ -1,4 +1,4 @@
-name: Release (CUDA 13.3 only)
+name: Windows CUDA 13.3 Full Build
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         type: boolean
   push:
     branches:
-      - gemma4-mtp          # trigger on push to this branch
+      - gemma4-mtp
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -32,7 +32,7 @@ jobs:
             echo "should_release=false" >> $GITHUB_OUTPUT
           fi
 
-  windows-cuda-13:
+  windows-cuda-full:
     needs: check_release
     if: needs.check_release.outputs.should_release == 'true'
     runs-on: windows-2022
@@ -52,7 +52,7 @@ jobs:
       - name: Install ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: windows-cuda-13.3
+          key: windows-cuda-13.3-full
           variant: ccache
           evict-old-files: 1d
 
@@ -64,88 +64,75 @@ jobs:
       - name: Install Ninja
         run: choco install ninja
 
-      - name: Build ggml-cuda.dll
+      - name: Build all tools
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_BACKEND_DL=ON ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_CPU=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
             -DGGML_CUDA=ON ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
-            -DGGML_CUDA_CUB_3DOT2=ON
-          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% --target ggml-cuda
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            %CMAKE_ARGS%
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
 
-      - name: Pack ggml-cuda.dll
+      - name: Copy CUDA runtime DLLs
         run: |
-          7z a -snl llama-bin-win-cuda-13.3-x64.zip .\build\bin\Release\ggml-cuda.dll
+          $dst = "build\bin\Release"
+          Copy-Item "$env:CUDA_PATH\bin\cudart64_13.dll" $dst
+          Copy-Item "$env:CUDA_PATH\bin\cublas64_13.dll" $dst
+          Copy-Item "$env:CUDA_PATH\bin\cublasLt64_13.dll" $dst
+          # OpenMP runtime (if needed)
+          Copy-Item "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\14.44.35112\debug_nonredist\x64\Microsoft.VC143.OpenMP.LLVM\libomp140.x86_64.dll" $dst -ErrorAction SilentlyContinue
 
-      - name: Pack CUDA runtime DLLs
+      - name: Determine tag name (from official action)
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts like official release
         run: |
-          $dst='.\build\bin\cudart\'
-          robocopy "$env:CUDA_PATH\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "$env:CUDA_PATH\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "$env:CUDA_PATH\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          7z a cudart-llama-bin-win-cuda-13.3-x64.zip $dst\*
+          $tag = "${{ steps.tag.outputs.name }}"
+          if (-not $tag) { $tag = "cuda13.3-$(Get-Date -Format 'yyyyMMdd-HHmmss')" }
+          $zipName = "llama-${tag}-bin-win-cuda-13.3-x64.zip"
+          Compress-Archive -Path "build\bin\Release\*" -DestinationPath $zipName
+          Write-Output "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
 
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          path: |
-            llama-bin-win-cuda-13.3-x64.zip
-            cudart-llama-bin-win-cuda-13.3-x64.zip
-          name: cuda-13.3-artifacts
+          name: windows-cuda-full-package
+          path: ${{ env.ZIP_NAME }}
 
   release:
-    needs: [windows-cuda-13]
+    needs: windows-cuda-full
     if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/gemma4-mtp') || github.event.inputs.create_release == 'true' }}
     permissions:
       contents: write
     runs-on: ubuntu-latest
     steps:
-      - name: Clone
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Determine tag name
-        id: tag
-        uses: ./.github/actions/get-tag-name
-
       - name: Download artifacts
         uses: actions/download-artifact@v7
         with:
-          path: ./release
+          name: windows-cuda-full-package
+
+      - name: Generate valid tag name
+        id: tag
+        run: |
+          # Use date+time+short commit hash
+          TAG="cuda13.3-$(date +'%Y%m%d-%H%M%S')-${GITHUB_SHA::7}"
+          echo "name=$TAG" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
-        id: create_release
-        uses: ggml-org/action-create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
+          name: "Windows CUDA 13.3 Full Build - gemma4-mtp"
           body: |
-            Windows CUDA 13.3 build for `gemma4-mtp` branch.
-            Contains `ggml-cuda.dll` and required CUDA runtime DLLs.
-
-      - name: Upload release assets
-        uses: actions/github-script@v8
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const release_id = '${{ steps.create_release.outputs.id }}';
-            const files = fs.readdirSync('./release');
-            for (const file of files) {
-              if (file.endsWith('.zip')) {
-                console.log(`Uploading ${file}`);
-                await github.rest.repos.uploadReleaseAsset({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  release_id: release_id,
-                  name: file,
-                  data: await fs.readFileSync(`./release/${file}`)
-                });
-              }
-            }
+            Full Windows build with CUDA 13.3 support for the `gemma4-mtp` branch.
+            Contains all executables (`llama-cli.exe`, `llama-server.exe`, etc.) and required DLLs.
+          files: |
+            *.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
