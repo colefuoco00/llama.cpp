@@ -83,9 +83,11 @@ jobs:
           evict-old-files: 1d
 
       - name: Install CUDA Toolkit
-        uses: ./.github/actions/windows-setup-cuda
+        id: cuda
+        uses: mjun0812/setup-cuda@v1
         with:
-          cuda_version: ${{ env.CUDA_VERSION }}
+          version: '13.3'
+          method: 'auto'
 
       - name: Install Ninja
         id: install_ninja
@@ -109,28 +111,14 @@ jobs:
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
 
-      - name: Copy CUDA runtime DLLs
+      - name: Verify CUDA
         shell: pwsh
         run: |
-          Write-Host "CUDA install location: $env:CUDA_PATH"
-
-          $dst = ".\build\bin\Release"
-          New-Item -ItemType Directory -Force -Path $dst | Out-Null
-
-          function Copy-CudaDlls {
-            param([string]$Source)
-
-            if (Test-Path $Source) {
-              robocopy $Source $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-              if ($LASTEXITCODE -le 7) {
-                $global:LASTEXITCODE = 0
-              }
-            }
-          }
-
-          Copy-CudaDlls "$env:CUDA_PATH\bin"
-          Copy-CudaDlls "$env:CUDA_PATH\lib"
-          Copy-CudaDlls "$env:CUDA_PATH\bin\x64"
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+          nvcc --version
+          Get-ChildItem "$env:CUDA_PATH\bin" -Filter "cudart64_*.dll"
+          Get-ChildItem "$env:CUDA_PATH\bin" -Filter "cublas64_*.dll"
+          Get-ChildItem "$env:CUDA_PATH\bin" -Filter "cublasLt64_*.dll"
 
       - name: Add license
         shell: pwsh
